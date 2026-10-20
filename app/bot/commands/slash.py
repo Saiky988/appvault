@@ -1,4 +1,4 @@
-"""Discord application commands (slash commands) with game/ID autocomplete for AppVault."""
+"""Discord application commands (slash commands) with game/ID autocomplete, iTunes icon, and donate prompt."""
 from __future__ import annotations
 
 import logging
@@ -16,11 +16,13 @@ from app.bot.embeds import (
     build_app_detail_embed,
     build_catalog_embed,
     build_check_outcome_embed,
+    build_donate_embed,
     build_search_embed,
     build_source_apps_embed,
     build_source_detail_embed,
     build_status_embed,
     build_updates_embed,
+    should_trigger_donate_prompt,
 )
 from app.core.config import get_settings
 from app.core.security import redact_sensitive_text
@@ -32,7 +34,11 @@ from app.monitoring.scheduler import (
     check_single_source,
 )
 from app.schemas.api import SourceBriefSchema
-from app.services.catalog import list_apps_paginated, reload_seed_catalog
+from app.services.catalog import (
+    fetch_itunes_artwork_512,
+    list_apps_paginated,
+    reload_seed_catalog,
+)
 from app.services.search import MAX_SEARCH_RESULTS, find_best_matching_app, search_apps
 from app.services.sources import (
     build_source_schema,
@@ -153,12 +159,10 @@ def _select_source_for_app(
 
     cleaned_opt = (id_option or "").strip().lower()
     if not cleaned_opt or cleaned_opt == "random":
-        # Prefer sources that already have account credentials extracted
         with_creds = [s for s in sources if s.account_email and s.account_password]
         pool = with_creds if with_creds else sources
         return random.choice(pool), "random"  # noqa: S311
 
-    # Extract digits if user passed 'ID 19' or '#19' or '19'
     m = re.search(r"\d+", cleaned_opt)
     target_id = int(m.group(0)) if m else None
     if target_id is not None:
@@ -172,32 +176,41 @@ def _select_source_for_app(
 def register_slash_commands(tree: app_commands.CommandTree, client: discord.Client) -> None:
     """Register all AppVault slash commands and /admin command group onto the CommandTree."""
 
+    @tree.command(name="donate", description="Ủng hộ chủ thớt duy trì bot và server")
+    async def cmd_donate(interaction: discord.Interaction) -> None:
+        embed = build_donate_embed()
+        await interaction.response.send_message(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @tree.command(name="search", description="Search across the app catalog by name, alias, or fuzzy match")
     @app_commands.describe(query="Application or game name to search for")
     async def cmd_search(interaction: discord.Interaction, query: str) -> None:
-        per_page = 5
+        per_page = 6
         with session_scope() as session:
             search_resp = search_apps(session, query, limit=MAX_SEARCH_RESULTS, offset=0)
 
         total_pages = max(1, math.ceil(len(search_resp.items) / per_page))
         embed = build_search_embed(search_resp, page=1, per_page=per_page)
+        attach_donate = should_trigger_donate_prompt()
+
+        send_kwargs: dict[str, object] = {
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if attach_donate:
+            send_kwargs["embeds"] = [embed, build_donate_embed()]
+        else:
+            send_kwargs["embed"] = embed
 
         if total_pages > 1:
-            view = PaginationView(
+            send_kwargs["view"] = PaginationView(
                 total_pages=total_pages,
                 page_builder=lambda p: build_search_embed(search_resp, page=p, per_page=per_page),
                 author_id=interaction.user.id,
             )
-            await interaction.response.send_message(
-                embed=embed,
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        else:
-            await interaction.response.send_message(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+
+        await interaction.response.send_message(**send_kwargs)  # type: ignore[arg-type]
 
     @cmd_search.autocomplete("query")
     async def _search_query_autocomplete(
@@ -221,7 +234,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
 
         if detail is None:
             await interaction.response.send_message(
-                f"No matching application found for `{redact_sensitive_text(name)[:60]}`.",
+                f"Không tìm thấy game phù hợp với `{redact_sensitive_text(name)[:60]}`.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -229,15 +242,15 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
 
         selected_source, mode_label = _select_source_for_app(detail.sources, id)
         if selected_source is None and mode_label.startswith("invalid:"):
-            valid_ids = ", ".join(f"#{s.source_id}" for s in detail.sources) or "None"
+            valid_ids = ", ".join(f"#{s.source_id}" for s in detail.sources) or "Chưa có"
             await interaction.response.send_message(
-                f"Game **{detail.canonical_name}** is not in ID `{id}`. Available IDs for this game: {valid_ids}.",
+                f"Game **{detail.canonical_name}** không có trong ID `{id}`. Các ID hỗ trợ game này: {valid_ids}.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
-        # If the selected source does not yet have cached credentials, attempt an on-demand fetch
+        # Fetch credentials on-demand if not yet cached
         if selected_source is not None and not (selected_source.account_email and selected_source.account_password):
             try:
                 await check_single_source(
@@ -255,15 +268,37 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             except Exception:
                 pass
 
+        # Fetch and cache 512px app icon from Apple iTunes Search API if not yet cached
+        icon_url = detail.icon_url
+        if not icon_url:
+            fetched_icon = await fetch_itunes_artwork_512(detail.normalized_name or detail.canonical_name)
+            if fetched_icon:
+                icon_url = fetched_icon
+                try:
+                    with session_scope() as session:
+                        app_row = session.get(App, detail.id)
+                        if app_row is not None:
+                            app_row.icon_url = fetched_icon
+                except Exception:
+                    pass
+
         embed = build_app_detail_embed(
             detail,
             selected_source=selected_source,
             selection_mode=mode_label,
+            icon_url=icon_url,
         )
-        await interaction.response.send_message(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+
+        if should_trigger_donate_prompt():
+            await interaction.response.send_message(
+                embeds=[embed, build_donate_embed()],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     @cmd_app.autocomplete("name")
     async def _app_name_autocomplete(
@@ -399,7 +434,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    @tree.command(name="source", description="Show source details, account credentials, monitoring health, and URL")
+    @tree.command(name="source", description="Show source details, account credentials, and game count")
     @app_commands.describe(id="Source ID (e.g. 1, 5, 15, 19, 20)")
     async def cmd_source(interaction: discord.Interaction, id: int) -> None:
         with session_scope() as session:

@@ -1,4 +1,4 @@
-"""Catalog service: app normalization, spelling corrections, versioned seed records, and idempotent seeding."""
+"""Catalog service: app normalization, iTunes artwork lookup, seed records, and idempotent seeding."""
 from __future__ import annotations
 
 import re
@@ -6,6 +6,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -20,7 +21,9 @@ from app.schemas.api import (
     SourceBriefSchema,
 )
 
-SEED_CATALOG_VERSION = "2026.10.4"
+SEED_CATALOG_VERSION = "2026.10.5"
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
+_ICON_MEMORY_CACHE: Dict[str, str] = {}
 
 SPELLING_CORRECTIONS: Dict[str, str] = {
     "subway subfers": "subway surfers",
@@ -155,12 +158,9 @@ SEED_SOURCES: Tuple[Dict[str, Any], ...] = (
     },
 )
 
-
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
-
 def normalize_raw_title(text: str) -> str:
-    """Normalize text into lowercase alphanumeric tokens without applying spelling corrections."""
     if not text:
         return ""
     pre_cleaned = (
@@ -178,9 +178,7 @@ def normalize_raw_title(text: str) -> str:
     tokens = _NON_ALNUM_RE.sub(" ", ascii_str).split()
     return " ".join(tokens)
 
-
 def normalize_app_name(title: str, *, apply_spelling_fixes: bool = True) -> str:
-    """Normalize an app title for deduplication and search, applying known spelling corrections."""
     raw_norm = normalize_raw_title(title)
     if not raw_norm:
         return ""
@@ -188,9 +186,62 @@ def normalize_app_name(title: str, *, apply_spelling_fixes: bool = True) -> str:
         return SPELLING_CORRECTIONS[raw_norm]
     return raw_norm
 
+async def fetch_itunes_artwork_512(
+    search_term: str,
+    *,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> Optional[str]:
+    cleaned_term = (search_term or "").strip()
+    if not cleaned_term:
+        return None
+
+    cache_key = normalize_app_name(cleaned_term, apply_spelling_fixes=True) or cleaned_term.lower()
+    short_key = cache_key.split()[0] if cache_key else ""
+    if cache_key in _ICON_MEMORY_CACHE:
+        return _ICON_MEMORY_CACHE[cache_key]
+    if short_key and short_key in _ICON_MEMORY_CACHE and cache_key.startswith("minecraft"):
+        return _ICON_MEMORY_CACHE[short_key]
+
+    query_candidates = [cache_key]
+    if ":" in cleaned_term:
+        base_part = normalize_app_name(cleaned_term.split(":", 1)[0], apply_spelling_fixes=True)
+        if base_part and base_part not in query_candidates:
+            query_candidates.append(base_part)
+    if cleaned_term.lower() not in query_candidates:
+        query_candidates.append(cleaned_term)
+
+    try:
+        async with httpx.AsyncClient(timeout=4.0, transport=transport) as client:
+            for term in query_candidates:
+                resp = await client.get(
+                    ITUNES_SEARCH_URL,
+                    params={
+                        "term": term,
+                        "entity": "software",
+                        "country": "us",
+                        "limit": 1,
+                    },
+                )
+                if resp.status_code != 200:
+                    continue
+                payload = resp.json()
+                results = payload.get("results") or []
+                if results and isinstance(results[0], dict):
+                    icon = (
+                        results[0].get("artworkUrl512")
+                        or results[0].get("artworkUrl100")
+                        or results[0].get("artworkUrl60")
+                    )
+                    if isinstance(icon, str) and icon.startswith("http"):
+                        _ICON_MEMORY_CACHE[cache_key] = icon
+                        if short_key:
+                            _ICON_MEMORY_CACHE.setdefault(short_key, icon)
+                        return icon
+    except Exception:
+        return None
+    return None
 
 def compute_source_health_status(source: Source) -> str:
-    """Return human-readable health status for a Source."""
     if not source.enabled:
         return "disabled"
     if source.last_error:
@@ -199,14 +250,12 @@ def compute_source_health_status(source: Source) -> str:
         return "healthy"
     return "seed_only"
 
-
 def ensure_app_and_aliases(
     session: Session,
     original_title: str,
     *,
     platform: str = "iOS",
 ) -> Tuple[App, bool, int]:
-    """Get or create canonical App record by normalized name and attach aliases idempotently."""
     clean_title = " ".join((original_title or "").split()).strip()
     if not clean_title or contains_sensitive_credentials(clean_title):
         raise ValueError("Invalid or sensitive app title rejected")
@@ -266,12 +315,10 @@ def ensure_app_and_aliases(
     session.flush()
     return existing_app, created_app, created_aliases
 
-
 def reload_seed_catalog(
     session: Session,
     seed_sources: Sequence[Dict[str, Any]] = SEED_SOURCES,
 ) -> CatalogReloadResponseSchema:
-    """Idempotently load or reload the versioned seed catalog and clean up any stray instructional rows."""
     from app.monitoring.parser import is_ignored_candidate_title
 
     sources_created = 0
@@ -357,7 +404,6 @@ def reload_seed_catalog(
 
         session.flush()
 
-    # Also purge any stray App rows that match instructional boilerplate
     all_apps = session.scalars(select(App)).all()
     for a in all_apps:
         if a.id not in all_seed_app_ids and (
@@ -366,7 +412,6 @@ def reload_seed_catalog(
         ):
             session.delete(a)
 
-    # Purge any legacy ChangeEvent rows whose summary contained instructional text from older parser runs
     all_events = session.scalars(select(ChangeEvent)).all()
     for ev in all_events:
         low_sum = (ev.summary or "").lower()
@@ -386,12 +431,10 @@ def reload_seed_catalog(
         aliases_created=aliases_created,
     )
 
-
 def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSchema]:
-    """Return all active SourceBriefSchema records associated with an App (authoritative shared query)."""
     links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.app_id == app_id, SourceApp.is_active == True)  # noqa: E712
+        .where(SourceApp.app_id == app_id, SourceApp.is_active == True)
         .order_by(SourceApp.source_id.asc(), SourceApp.display_order.asc())
     ).all()
 
@@ -428,9 +471,7 @@ def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSche
         )
     return source_briefs
 
-
 def build_app_summary(session: Session, app: App) -> AppSummarySchema:
-    """Hydrate an AppSummarySchema with its linked sources and aliases."""
     source_briefs = get_app_source_briefs(session, app.id)
     source_ids = [s.source_id for s in source_briefs]
 
@@ -445,6 +486,7 @@ def build_app_summary(session: Session, app: App) -> AppSummarySchema:
         canonical_name=app.canonical_name,
         normalized_name=app.normalized_name,
         platform=app.platform,
+        icon_url=app.icon_url,
         source_ids=source_ids,
         sources=source_briefs,
         aliases=list(aliases),
@@ -452,14 +494,12 @@ def build_app_summary(session: Session, app: App) -> AppSummarySchema:
         updated_at=app.updated_at,
     )
 
-
 def list_apps_paginated(
     session: Session,
     *,
     limit: int = 20,
     offset: int = 0,
 ) -> PaginatedResponse[AppSummarySchema]:
-    """Return paginated canonical apps ordered alphabetically."""
     total = int(session.scalar(select(func.count(App.id))) or 0)
     apps = session.scalars(
         select(App)
@@ -475,9 +515,7 @@ def list_apps_paginated(
         items=items,
     )
 
-
 def get_app_detail(session: Session, app_id: int) -> Optional[AppDetailSchema]:
-    """Return full details for a single App including source links and recent change history."""
     app = session.get(App, app_id)
     if app is None:
         return None
