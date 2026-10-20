@@ -72,6 +72,8 @@ async def check_single_source(
                 change_event_id=None,
                 extracted_app_count=0,
                 data_origin="seed",
+                account_email=source.account_email,
+                account_password=source.account_password,
                 error=source.last_error,
                 checked_at=datetime.now(timezone.utc),
             )
@@ -83,8 +85,10 @@ async def check_single_source(
 
         actual_id = source.id
         target_url = source.url
-        etag = source.etag
-        last_modified = source.last_modified
+        # Only send conditional ETag/Last-Modified if we already extracted credentials at least once
+        has_cached_creds = bool(source.account_email and source.account_password)
+        etag = source.etag if has_cached_creds else None
+        last_modified = source.last_modified if has_cached_creds else None
 
     try:
         fetch_result = await page_fetcher.fetch(
@@ -171,7 +175,6 @@ async def check_all_enabled_sources(
         if res is not None:
             outcomes.append(res)
 
-    # Also retry any pending notifications whose backoff timer has elapsed
     with session_scope() as session:
         await dispatch_pending_notifications(
             session,

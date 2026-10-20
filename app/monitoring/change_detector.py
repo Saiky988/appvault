@@ -1,4 +1,4 @@
-"""Change detection and source catalog update pipeline."""
+"""Change detection, account credential extraction, and source catalog update pipeline."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -46,7 +46,7 @@ def apply_fetch_and_detect_changes(
     source: Source,
     fetch_result: FetchResult,
 ) -> SourceCheckOutcomeSchema:
-    """Process a FetchResult for a Source, preserving seed data on errors/304 and recording meaningful changes."""
+    """Process a FetchResult for a Source, updating account credentials and preserving seed apps."""
     now = datetime.now(timezone.utc)
     source.last_checked_at = now
     source.updated_at = now
@@ -57,7 +57,6 @@ def apply_fetch_and_detect_changes(
         .order_by(SourceApp.display_order.asc(), SourceApp.app_id.asc())
     ).all()
 
-    # Ensure seed links are never left deactivated
     seed_norms = _get_seed_normalized_names_for_source(source.id)
     for lk in all_links:
         if lk.data_origin == "seed" and not lk.is_active:
@@ -86,11 +85,13 @@ def apply_fetch_and_detect_changes(
             change_event_id=None,
             extracted_app_count=len(active_links),
             data_origin=current_origin,
+            account_email=source.account_email,
+            account_password=source.account_password,
             error=safe_error,
             checked_at=now,
         )
 
-    # 2. Handle HTTP 304 Not Modified: never interpret 304 as an empty document; preserve seed/observed records
+    # 2. Handle HTTP 304 Not Modified: preserve seed/observed records and existing credentials
     if fetch_result.not_modified:
         source.last_success_at = now
         source.last_http_status = 304
@@ -110,6 +111,8 @@ def apply_fetch_and_detect_changes(
             change_event_id=None,
             extracted_app_count=len(active_links),
             data_origin=current_origin,
+            account_email=source.account_email,
+            account_password=source.account_password,
             error=None,
             checked_at=now,
         )
@@ -117,8 +120,8 @@ def apply_fetch_and_detect_changes(
     # 3. Parse HTML content
     parsed: ParsedArticle = parse_public_listing_html(fetch_result.content)
 
-    # If extraction found 0 apps and no meaningful body, treat as unparseable and preserve catalog
-    if not parsed.apps and not parsed.sanitized_body_lines:
+    has_credentials = bool(parsed.account_email or parsed.account_password)
+    if not parsed.apps and not parsed.sanitized_body_lines and not has_credentials:
         err_msg = "Page fetched but no parseable public app listing or article content found; preserving catalog"
         source.last_http_status = fetch_result.status_code or 200
         source.last_error = err_msg
@@ -133,18 +136,35 @@ def apply_fetch_and_detect_changes(
             change_event_id=None,
             extracted_app_count=len(active_links),
             data_origin=current_origin,
+            account_email=source.account_email,
+            account_password=source.account_password,
             error=err_msg,
             checked_at=now,
         )
 
     previous_hash = source.current_content_hash
+    prev_email = source.account_email
+    prev_password = source.account_password
+
+    credentials_changed = False
+    if parsed.account_email is not None or parsed.account_password is not None:
+        if parsed.account_email != prev_email or parsed.account_password != prev_password:
+            credentials_changed = True
+        if parsed.account_email is not None:
+            source.account_email = parsed.account_email
+        if parsed.account_password is not None:
+            source.account_password = parsed.account_password
+        source.account_updated_at = now
+        # Mark seed links on this live-verified source as observed
+        for lk in active_links:
+            lk.data_origin = "observed"
+            lk.last_seen_at = now
+
     old_app_names: List[str] = []
-    old_app_ids: Set[int] = set()
     for lk in active_links:
         app_obj = session.get(App, lk.app_id)
         if app_obj:
             old_app_names.append(app_obj.canonical_name)
-            old_app_ids.add(app_obj.id)
 
     added_titles: List[str] = []
     removed_titles: List[str] = []
@@ -180,7 +200,6 @@ def apply_fetch_and_detect_changes(
                     )
                 )
             else:
-                # Preserve original seed title if this was a seed record, but mark provenance as observed
                 if existing_link.data_origin != "seed":
                     existing_link.original_title = raw_title
                     existing_link.display_order = idx
@@ -191,7 +210,6 @@ def apply_fetch_and_detect_changes(
         old_set = set(old_app_names)
         added_titles = [n for n in new_canonical_names if n not in old_set]
 
-        # Only deactivate previously observed non-seed apps if the page was not a seed-backed instructional page
         for lk in active_links:
             if lk.app_id not in new_app_ids_ordered:
                 app_obj = session.get(App, lk.app_id)
@@ -221,7 +239,7 @@ def apply_fetch_and_detect_changes(
         source.last_modified = fetch_result.last_modified
 
     new_hash = parsed.content_hash
-    if previous_hash == new_hash:
+    if previous_hash == new_hash and not credentials_changed:
         session.flush()
         return SourceCheckOutcomeSchema(
             source_id=source.id,
@@ -233,16 +251,21 @@ def apply_fetch_and_detect_changes(
             change_event_id=None,
             extracted_app_count=active_count,
             data_origin=effective_origin,
+            account_email=source.account_email,
+            account_password=source.account_password,
             error=None,
             checked_at=now,
         )
 
-    # Determine meaningful event_type and summary
-    if previous_hash is None:
+    if credentials_changed:
+        event_type = "credentials_updated" if previous_hash is not None else "initial_observation"
+        summary = (
+            f"ID #{source.id} updated account credentials "
+            f"(Account: {source.account_email or 'N/A'})."
+        )
+    elif previous_hash is None:
         event_type = "initial_observation"
-        summary_parts = [
-            f"Source #{source.id} verified live ({active_count} apps in catalog)."
-        ]
+        summary_parts = [f"Source #{source.id} verified live ({active_count} apps in catalog)."]
         if added_titles:
             summary_parts.append(f"Added: {', '.join(added_titles[:5])}")
         if removed_titles:
@@ -261,10 +284,8 @@ def apply_fetch_and_detect_changes(
         safe_title = redact_sensitive_text(parsed.title or f"Source #{source.id}")
         summary = f"Source #{source.id} article content updated ('{safe_title[:80]}')."
 
-    summary = redact_sensitive_text(summary)
     source.current_content_hash = new_hash
 
-    # Deduplicate ChangeEvent by (source_id, current_hash)
     existing_event = session.scalar(
         select(ChangeEvent).where(
             ChangeEvent.source_id == source.id,
@@ -275,11 +296,12 @@ def apply_fetch_and_detect_changes(
     change_event_id: Optional[int] = None
     if existing_event is None:
         details = {
-            "title": redact_sensitive_text(parsed.title),
+            "title": parsed.title,
             "added_apps": added_titles,
             "removed_apps": removed_titles,
             "observed_app_count": len(parsed.apps),
             "active_catalog_count": active_count,
+            "account_email": source.account_email,
         }
         new_event = ChangeEvent(
             source_id=source.id,
@@ -287,6 +309,8 @@ def apply_fetch_and_detect_changes(
             previous_hash=previous_hash,
             current_hash=new_hash,
             summary=summary,
+            account_email=source.account_email,
+            account_password=source.account_password,
             details_json=json.dumps(details, ensure_ascii=False),
             detected_at=now,
             notification_status="pending",
@@ -308,6 +332,8 @@ def apply_fetch_and_detect_changes(
         change_event_id=change_event_id,
         extracted_app_count=active_count,
         data_origin=effective_origin,
+        account_email=source.account_email,
+        account_password=source.account_password,
         error=None,
         checked_at=now,
     )

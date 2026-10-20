@@ -25,7 +25,7 @@ from app.schemas.api import (
     StatsResponseSchema,
     WorkerStateResponseSchema,
 )
-from app.services.catalog import compute_source_health_status
+from app.services.catalog import compute_source_health_status, normalize_app_name
 
 
 def get_or_create_worker_state(session: Session) -> WorkerState:
@@ -130,7 +130,7 @@ def get_active_source_links(session: Session, source_id: int) -> List[SourceApp]
 
 
 def build_source_schema(session: Session, source: Source) -> SourceSchema:
-    """Convert a Source ORM instance into a SourceSchema with app counts."""
+    """Convert a Source ORM instance into a SourceSchema with app counts and credentials."""
     settings = get_settings()
     links = get_active_source_links(session, source.id)
     seed_count = sum(1 for link in links if link.data_origin == "seed")
@@ -148,6 +148,9 @@ def build_source_schema(session: Session, source: Source) -> SourceSchema:
         app_count=len(links),
         seed_app_count=seed_count,
         observed_app_count=observed_count,
+        account_email=source.account_email,
+        account_password=source.account_password,
+        account_updated_at=source.account_updated_at,
         last_checked_at=source.last_checked_at,
         last_success_at=source.last_success_at,
         last_http_status=source.last_http_status,
@@ -236,11 +239,16 @@ def list_updates_paginated(
     limit: int = 20,
     offset: int = 0,
     source_id: Optional[int] = None,
+    source_ids: Optional[List[int]] = None,
 ) -> PaginatedResponse[ChangeEventSchema]:
     """Return paginated list of detected ChangeEvents ordered newest-first."""
     stmt = select(ChangeEvent)
     if source_id is not None:
         stmt = stmt.where(ChangeEvent.source_id == source_id)
+    elif source_ids is not None:
+        if not source_ids:
+            return PaginatedResponse[ChangeEventSchema](total=0, limit=limit, offset=offset, items=[])
+        stmt = stmt.where(ChangeEvent.source_id.in_(source_ids))
 
     all_matching = session.scalars(
         stmt.order_by(ChangeEvent.detected_at.desc(), ChangeEvent.id.desc())
@@ -261,6 +269,8 @@ def list_updates_paginated(
                 previous_hash=ev.previous_hash,
                 current_hash=ev.current_hash,
                 summary=ev.summary,
+                account_email=ev.account_email or (src.account_email if src else None),
+                account_password=ev.account_password or (src.account_password if src else None),
                 detected_at=ev.detected_at,
                 notification_status=ev.notification_status,
                 notification_attempts=ev.notification_attempts,
@@ -290,6 +300,8 @@ def get_update_by_id(session: Session, event_id: int) -> Optional[ChangeEventSch
         previous_hash=ev.previous_hash,
         current_hash=ev.current_hash,
         summary=ev.summary,
+        account_email=ev.account_email or (src.account_email if src else None),
+        account_password=ev.account_password or (src.account_password if src else None),
         detected_at=ev.detected_at,
         notification_status=ev.notification_status,
         notification_attempts=ev.notification_attempts,
@@ -347,18 +359,22 @@ def upsert_discord_subscription(
     *,
     guild_id: str,
     channel_id: str,
-    event_types: str = "initial_observation,apps_updated,title_changed,content_updated",
+    event_types: str = "initial_observation,credentials_updated,apps_updated,title_changed,content_updated",
+    game_filter: Optional[str] = None,
 ) -> Tuple[DiscordSubscription, bool]:
-    """Create or re-enable a Discord channel subscription."""
+    """Create or update a Discord channel subscription (for all games or a specific game)."""
     existing = session.scalar(
         select(DiscordSubscription).where(DiscordSubscription.channel_id == str(channel_id))
     )
+    norm_game = normalize_app_name(game_filter) if game_filter else None
+
     if existing is None:
         sub = DiscordSubscription(
             guild_id=str(guild_id),
             channel_id=str(channel_id),
             enabled=True,
             subscribed_event_types=event_types,
+            game_filter=norm_game,
             created_at=datetime.now(timezone.utc),
         )
         session.add(sub)
@@ -368,6 +384,18 @@ def upsert_discord_subscription(
     existing.guild_id = str(guild_id)
     existing.enabled = True
     existing.subscribed_event_types = event_types
+    if norm_game is None:
+        existing.game_filter = None
+    else:
+        current_filters = [
+            f.strip()
+            for f in (existing.game_filter or "").split(",")
+            if f.strip()
+        ]
+        if norm_game not in current_filters:
+            current_filters.append(norm_game)
+        existing.game_filter = ",".join(current_filters)
+
     session.flush()
     return existing, False
 

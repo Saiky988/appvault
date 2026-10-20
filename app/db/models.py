@@ -53,7 +53,7 @@ class App(Base):
 
 
 class Source(Base):
-    """Monitored public listing source page."""
+    """Monitored public listing source page and its extracted account credentials."""
 
     __tablename__ = "sources"
     __table_args__ = (
@@ -66,6 +66,11 @@ class Source(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     check_interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+
+    # Extracted account credentials from <div class="copy-buttons">
+    account_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
+    account_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
+    account_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
@@ -139,6 +144,8 @@ class ChangeEvent(Base):
     previous_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, default=None)
     current_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
+    account_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
+    account_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
     details_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
@@ -153,7 +160,7 @@ class ChangeEvent(Base):
 
 
 class DiscordSubscription(Base):
-    """Guild channel subscription for automated change notifications."""
+    """Guild channel subscription for automated change notifications (all games or filtered by game)."""
 
     __tablename__ = "discord_subscriptions"
     __table_args__ = (
@@ -167,8 +174,11 @@ class DiscordSubscription(Base):
     channel_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     subscribed_event_types: Mapped[str] = mapped_column(
-        String(255), nullable=False, default="initial_observation,apps_updated,title_changed,content_updated"
+        String(255),
+        nullable=False,
+        default="initial_observation,credentials_updated,apps_updated,title_changed,content_updated",
     )
+    game_filter: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 

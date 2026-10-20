@@ -1,12 +1,15 @@
-"""Discord application commands (slash commands) for AppVault."""
+"""Discord application commands (slash commands) with game/ID autocomplete for AppVault."""
 from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
+import random
+import re
+from typing import List, Optional
 
 import discord
 from discord import app_commands
+from sqlalchemy import select
 
 from app.bot.embeds import (
     PaginationView,
@@ -21,12 +24,14 @@ from app.bot.embeds import (
 )
 from app.core.config import get_settings
 from app.core.security import redact_sensitive_text
+from app.db.models import App, Source
 from app.db.session import check_db_health, session_scope
 from app.monitoring.scheduler import (
     SourceCheckAlreadyRunningError,
     check_all_enabled_sources,
     check_single_source,
 )
+from app.schemas.api import SourceBriefSchema
 from app.services.catalog import list_apps_paginated, reload_seed_catalog
 from app.services.search import MAX_SEARCH_RESULTS, find_best_matching_app, search_apps
 from app.services.sources import (
@@ -36,6 +41,7 @@ from app.services.sources import (
     get_or_create_worker_state,
     get_source_by_id_or_key,
     list_source_apps_paginated,
+    list_sources_paginated,
     list_updates_paginated,
     set_worker_paused,
     upsert_discord_subscription,
@@ -64,6 +70,103 @@ def has_channel_subscription_permission(interaction: discord.Interaction) -> boo
         or getattr(perms, "manage_guild", False)
         or getattr(perms, "manage_channels", False)
     )
+
+
+def get_game_autocomplete_choices(current: str, *, include_all_option: bool = False) -> List[app_commands.Choice[str]]:
+    """Return up to 25 game choices: shows featured catalog games when empty, or live fuzzy search matches as user types."""
+    query = (current or "").strip()
+    choices: List[app_commands.Choice[str]] = []
+
+    if include_all_option and (not query or "all".startswith(query.lower())):
+        choices.append(app_commands.Choice(name="All Games (Tat ca game)", value="all"))
+
+    limit = 25 - len(choices)
+    with session_scope() as session:
+        if not query:
+            apps = session.scalars(
+                select(App).order_by(App.id.asc()).limit(limit)
+            ).all()
+            for a in apps:
+                choices.append(
+                    app_commands.Choice(
+                        name=a.canonical_name[:100],
+                        value=a.canonical_name[:100],
+                    )
+                )
+        else:
+            search_resp = search_apps(session, query, limit=limit, offset=0)
+            for item in search_resp.items[:limit]:
+                app = item.app
+                sids = ", ".join(f"#{sid}" for sid in app.source_ids)
+                label = f"{app.canonical_name} (ID: {sids})" if sids else app.canonical_name
+                choices.append(
+                    app_commands.Choice(
+                        name=label[:100],
+                        value=app.canonical_name[:100],
+                    )
+                )
+    return choices[:25]
+
+
+def get_source_id_autocomplete_choices(
+    game_name: Optional[str],
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Return choices for `/app id:`: Random + matching IDs for the selected game (or all IDs)."""
+    q = (current or "").strip().lower()
+    choices: List[app_commands.Choice[str]] = []
+
+    with session_scope() as session:
+        matching_ids: List[int] = []
+        if game_name and game_name.strip():
+            detail = find_best_matching_app(session, game_name.strip())
+            if detail and detail.source_ids:
+                matching_ids = list(detail.source_ids)
+
+        if not matching_ids:
+            all_srcs = session.scalars(select(Source).order_by(Source.id.asc())).all()
+            matching_ids = [s.id for s in all_srcs]
+
+    random_label = (
+        f"Random (Ngau nhien trong ID: {', '.join(str(i) for i in matching_ids)})"
+        if matching_ids
+        else "Random"
+    )
+    if not q or "random".startswith(q):
+        choices.append(app_commands.Choice(name=random_label[:100], value="Random"))
+
+    for sid in matching_ids:
+        sid_str = str(sid)
+        if not q or q in sid_str or f"id {sid_str}".startswith(q):
+            choices.append(app_commands.Choice(name=f"ID {sid}", value=sid_str))
+
+    return choices[:25]
+
+
+def _select_source_for_app(
+    sources: List[SourceBriefSchema],
+    id_option: Optional[str],
+) -> tuple[Optional[SourceBriefSchema], str]:
+    """Select a SourceBriefSchema based on id_option ('Random', None, or a specific ID like '19')."""
+    if not sources:
+        return None, "none"
+
+    cleaned_opt = (id_option or "").strip().lower()
+    if not cleaned_opt or cleaned_opt == "random":
+        # Prefer sources that already have account credentials extracted
+        with_creds = [s for s in sources if s.account_email and s.account_password]
+        pool = with_creds if with_creds else sources
+        return random.choice(pool), "random"  # noqa: S311
+
+    # Extract digits if user passed 'ID 19' or '#19' or '19'
+    m = re.search(r"\d+", cleaned_opt)
+    target_id = int(m.group(0)) if m else None
+    if target_id is not None:
+        for s in sources:
+            if s.source_id == target_id:
+                return s, f"id:{target_id}"
+
+    return None, f"invalid:{id_option}"
 
 
 def register_slash_commands(tree: app_commands.CommandTree, client: discord.Client) -> None:
@@ -96,9 +199,23 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    @tree.command(name="app", description="Show details, sources, and change history for one matching app")
-    @app_commands.describe(name="Name or alias of the application")
-    async def cmd_app(interaction: discord.Interaction, name: str) -> None:
+    @cmd_search.autocomplete("query")
+    async def _search_query_autocomplete(
+        _interaction: discord.Interaction,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        return get_game_autocomplete_choices(current, include_all_option=False)
+
+    @tree.command(name="app", description="Get account and password for a game (Random or specific ID)")
+    @app_commands.describe(
+        name="Select or type a game name",
+        id="Optional: Random or specific Source ID (e.g. Random, 1, 5, 15, 19, 20)",
+    )
+    async def cmd_app(
+        interaction: discord.Interaction,
+        name: str,
+        id: Optional[str] = None,
+    ) -> None:
         with session_scope() as session:
             detail = find_best_matching_app(session, name)
 
@@ -110,11 +227,59 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             )
             return
 
-        embed = build_app_detail_embed(detail)
+        selected_source, mode_label = _select_source_for_app(detail.sources, id)
+        if selected_source is None and mode_label.startswith("invalid:"):
+            valid_ids = ", ".join(f"#{s.source_id}" for s in detail.sources) or "None"
+            await interaction.response.send_message(
+                f"Game **{detail.canonical_name}** is not in ID `{id}`. Available IDs for this game: {valid_ids}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        # If the selected source does not yet have cached credentials, attempt an on-demand fetch
+        if selected_source is not None and not (selected_source.account_email and selected_source.account_password):
+            try:
+                await check_single_source(
+                    selected_source.source_id,
+                    worker_id=f"app-ondemand-{interaction.user.id}",
+                )
+                with session_scope() as session:
+                    refreshed = find_best_matching_app(session, detail.canonical_name)
+                    if refreshed is not None:
+                        detail = refreshed
+                        for s in detail.sources:
+                            if s.source_id == selected_source.source_id:
+                                selected_source = s
+                                break
+            except Exception:
+                pass
+
+        embed = build_app_detail_embed(
+            detail,
+            selected_source=selected_source,
+            selection_mode=mode_label,
+        )
         await interaction.response.send_message(
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @cmd_app.autocomplete("name")
+    async def _app_name_autocomplete(
+        _interaction: discord.Interaction,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        return get_game_autocomplete_choices(current, include_all_option=False)
+
+    @cmd_app.autocomplete("id")
+    async def _app_id_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        ns = getattr(interaction, "namespace", None)
+        selected_game = getattr(ns, "name", None) if ns is not None else None
+        return get_source_id_autocomplete_choices(selected_game, current)
 
     @tree.command(name="source-apps", description="List all applications associated with a specific source ID")
     @app_commands.describe(source_id="Source ID (e.g. 1, 5, 15, 19, 20)")
@@ -234,7 +399,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    @tree.command(name="source", description="Show source details, monitoring health, interval, and URL")
+    @tree.command(name="source", description="Show source details, account credentials, monitoring health, and URL")
     @app_commands.describe(id="Source ID (e.g. 1, 5, 15, 19, 20)")
     async def cmd_source(interaction: discord.Interaction, id: int) -> None:
         with session_scope() as session:
@@ -254,27 +419,66 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @tree.command(name="updates", description="Show recent detected source changes with timestamps and links")
-    @app_commands.describe(limit="Maximum number of recent updates to display (1-20)")
+    @tree.command(name="updates", description="Show recent account updates and latest credentials")
+    @app_commands.describe(
+        limit="Maximum number of recent updates to display (1-20)",
+        game="Optional: Filter account updates by game name",
+    )
     async def cmd_updates(
         interaction: discord.Interaction,
         limit: int = 5,
+        game: Optional[str] = None,
     ) -> None:
         safe_limit = max(1, min(int(limit), 20))
         with session_scope() as session:
-            updates_resp = list_updates_paginated(session, limit=safe_limit, offset=0)
+            filter_sids: Optional[List[int]] = None
+            matched_game_title: Optional[str] = None
+            if game and game.strip() and game.strip().lower() != "all":
+                detail = find_best_matching_app(session, game.strip())
+                if detail is not None:
+                    filter_sids = list(detail.source_ids)
+                    matched_game_title = detail.canonical_name
+                else:
+                    filter_sids = []
+                    matched_game_title = game.strip()
 
-        embed = build_updates_embed(updates_resp.items, safe_limit)
+            updates_resp = list_updates_paginated(
+                session,
+                limit=safe_limit,
+                offset=0,
+                source_ids=filter_sids,
+            )
+            all_sources = list_sources_paginated(session, limit=20, offset=0).items
+            if filter_sids is not None:
+                all_sources = [s for s in all_sources if s.id in filter_sids]
+
+        embed = build_updates_embed(
+            updates_resp.items,
+            safe_limit,
+            sources=all_sources,
+            game_query=matched_game_title,
+        )
         await interaction.response.send_message(
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @tree.command(name="subscribe", description="Subscribe a channel to source change notifications")
-    @app_commands.describe(channel="Target Discord text channel for notifications")
+    @cmd_updates.autocomplete("game")
+    async def _updates_game_autocomplete(
+        _interaction: discord.Interaction,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        return get_game_autocomplete_choices(current, include_all_option=True)
+
+    @tree.command(name="subscribe", description="Subscribe a channel to latest account updates (all games or a specific game)")
+    @app_commands.describe(
+        channel="Target Discord text channel for notifications",
+        game="Optional: Game name to subscribe to (leave empty for all games)",
+    )
     async def cmd_subscribe(
         interaction: discord.Interaction,
         channel: discord.TextChannel,
+        game: Optional[str] = None,
     ) -> None:
         if not has_channel_subscription_permission(interaction):
             await interaction.response.send_message(
@@ -292,18 +496,51 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             )
             return
 
+        selected_game_filter: Optional[str] = None
+        matched_game_label = "All Games"
+        matched_sids_label = "All IDs"
+
         with session_scope() as session:
+            if game and game.strip() and game.strip().lower() != "all":
+                detail = find_best_matching_app(session, game.strip())
+                if detail is None:
+                    await interaction.response.send_message(
+                        f"No matching game found for `{redact_sensitive_text(game)[:60]}`.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                selected_game_filter = detail.canonical_name
+                matched_game_label = detail.canonical_name
+                matched_sids_label = ", ".join(f"#{sid}" for sid in detail.source_ids) or "None"
+
             sub, created = upsert_discord_subscription(
                 session,
                 guild_id=str(interaction.guild_id),
                 channel_id=str(channel.id),
+                game_filter=selected_game_filter,
             )
 
         action_word = "Subscribed" if created else "Updated subscription for"
+        if selected_game_filter:
+            msg = (
+                f"{action_word} <#{sub.channel_id}> to account updates for "
+                f"**{matched_game_label}** (IDs: {matched_sids_label})."
+            )
+        else:
+            msg = f"{action_word} <#{sub.channel_id}> to all AppVault account updates."
+
         await interaction.response.send_message(
-            f"{action_word} <#{sub.channel_id}> to AppVault change notifications.",
+            msg,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @cmd_subscribe.autocomplete("game")
+    async def _subscribe_game_autocomplete(
+        _interaction: discord.Interaction,
+        current: str,
+    ) -> List[app_commands.Choice[str]]:
+        return get_game_autocomplete_choices(current, include_all_option=True)
 
     @tree.command(name="unsubscribe", description="Disable change notifications for the current channel")
     async def cmd_unsubscribe(interaction: discord.Interaction) -> None:
@@ -445,7 +682,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             only_due=False,
         )
         lines = [
-            f"- **Source #{o.source_id}**: `{o.status}` (HTTP `{o.http_status or 'N/A'}` | Apps: `{o.extracted_app_count}`)"
+            f"- **ID #{o.source_id}**: `{o.status}` | Account: `{o.account_email or 'N/A'}` | Pass: `{o.account_password or 'N/A'}`"
             + (f" — Error: `{redact_sensitive_text(o.error)[:60]}`" if o.error else "")
             for o in outcomes
         ]

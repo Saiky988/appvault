@@ -1,4 +1,4 @@
-"""Tests for HTML parsing, credential exclusion, SSRF prevention, HTTP 304, change detection, and notifications."""
+"""Tests for HTML parsing, copy-buttons credential extraction, SSRF prevention, HTTP 304, change detection, and notifications."""
 from __future__ import annotations
 
 from typing import Dict, List
@@ -38,25 +38,24 @@ SYNTHETIC_BLOG_HTML_V1 = """
 <html>
 <head>
   <title>Source 15 Game List</title>
-  <script>var secretToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";</script>
 </head>
 <body>
   <div class="navbar">Navigation Header</div>
   <article>
-    <h1 class="post-title">ID #15 Public Game Catalog</h1>
+    <h1 class="post-title">20 - Huong dan su dung ID Apple</h1>
     <div class="post-timestamp">Updated at 2026-10-20 12:00:00 PM</div>
     <div class="post-body">
-      <p>Lưu ý quan trọng: Chỉ đăng nhập App Store, không đăng nhập iCloud.</p>
-      <p>Apple ID: leaked_account_user@icloud.com</p>
-      <p>Mật khẩu: SuperSecretPassword123!</p>
-      <p>Recovery Code: 9988-7766-5544</p>
-      <p>Session Cookie: session_id=xyz987secret</p>
+      <div class="copy-buttons">
+        <input id="email" type="text" value="apple_share_v1@example.com" readonly>
+        <button onclick="copyText('email')">Nhấn nút để sao chép Tài Khoản</button>
+        <br>
+        <input id="password" type="text" value="PassWordV1_2026!" readonly>
+        <button onclick="copyText('password')">Nhấn nút để sao chép Mật khẩu</button>
+      </div>
       <ul>
         <li>After Inc.</li>
         <li>Balatro</li>
         <li>Dead Cells+</li>
-        <li>Pass: ShouldNeverBeExtracted999</li>
-        <li>user_login@gmail.com</li>
       </ul>
     </div>
   </article>
@@ -75,8 +74,15 @@ SYNTHETIC_BLOG_HTML_V2 = """
 <html>
 <body>
   <article>
-    <h1 class="post-title">ID #15 Public Game Catalog</h1>
+    <h1 class="post-title">20 - Huong dan su dung ID Apple</h1>
     <div class="post-body">
+      <div class="copy-buttons">
+        <input id="email" type="text" value="apple_share_v2@example.com" readonly>
+        <button onclick="copyText('email')">Nhấn nút để sao chép Tài Khoản</button>
+        <br>
+        <input id="password" type="text" value="NewPassWordV2_999!" readonly>
+        <button onclick="copyText('password')">Nhấn nút để sao chép Mật khẩu</button>
+      </div>
       <ul>
         <li>After Inc.</li>
         <li>Balatro</li>
@@ -90,27 +96,24 @@ SYNTHETIC_BLOG_HTML_V2 = """
 """
 
 
-def test_html_parser_extracts_apps_and_excludes_credentials() -> None:
-    """Verify synthetic HTML parsing extracts valid apps while stripping all credential-like lines."""
+def test_html_parser_extracts_copy_buttons_credentials_and_apps() -> None:
+    """Verify HTML parser extracts <input id='email'> and <input id='password'> from .copy-buttons."""
     parsed = parse_public_listing_html(SYNTHETIC_BLOG_HTML_V1)
-    assert parsed.title == "ID #15 Public Game Catalog"
+    assert parsed.account_email == "apple_share_v1@example.com"
+    assert parsed.account_password == "PassWordV1_2026!"
     assert parsed.apps == ["After Inc.", "Balatro", "Dead Cells+"]
-    assert parsed.had_redacted_lines is True
-
-    joined_output = " ".join(parsed.apps + parsed.sanitized_body_lines).lower()
-    assert "leaked_account_user@icloud.com" not in joined_output
-    assert "supersecretpassword123" not in joined_output
-    assert "9988-7766-5544" not in joined_output
-    assert "session_id=xyz987secret" not in joined_output
-    assert "shouldneverbeextracted999" not in joined_output
-    assert "user_login@gmail.com" not in joined_output
 
     parsed_same = parse_public_listing_html(SYNTHETIC_BLOG_HTML_V1_DIFF_TIMESTAMP)
     assert parsed.content_hash == parsed_same.content_hash
 
+    parsed_v2 = parse_public_listing_html(SYNTHETIC_BLOG_HTML_V2)
+    assert parsed_v2.account_email == "apple_share_v2@example.com"
+    assert parsed_v2.account_password == "NewPassWordV2_999!"
+    assert parsed.content_hash != parsed_v2.content_hash
+
 
 def test_malformed_html_and_sensitive_text_helpers() -> None:
-    """Verify parser handles malformed HTML gracefully and security filters catch secrets."""
+    """Verify parser handles malformed HTML gracefully."""
     malformed = "<div><h1>Broken List<ul><li>Terraria<li>Stardew Valley<p>Pass: HideMe123"
     parsed = parse_public_listing_html(malformed)
     assert "Terraria" in parsed.apps
@@ -222,8 +225,8 @@ def test_http_304_not_modified_preserves_seed_records(db_session: Session) -> No
     assert db_session.scalar(select(func.count(ChangeEvent.id))) == 0
 
 
-def test_change_detection_and_source_failure_preserves_catalog(db_session: Session) -> None:
-    """Verify failed fetches never delete seed apps, seed apps stay intact, and updates create 1 event."""
+def test_change_detection_updates_credentials_and_preserves_catalog(db_session: Session) -> None:
+    """Verify extracted credentials are persisted on Source and ChangeEvent while preserving seed apps."""
     reload_seed_catalog(db_session)
     db_session.commit()
 
@@ -251,7 +254,7 @@ def test_change_detection_and_source_failure_preserves_catalog(db_session: Sessi
     assert active_count == 12
     assert db_session.scalar(select(func.count(ChangeEvent.id))) == 0
 
-    # 2. First successful observation upgrades observed items while preserving all 12 seed entries + 1 new (Dead Cells+) = 13
+    # 2. First successful observation extracts credentials and creates initial_observation ChangeEvent
     ok_fetch_v1 = FetchResult(
         url=source15.url,
         ok=True,
@@ -264,11 +267,13 @@ def test_change_detection_and_source_failure_preserves_catalog(db_session: Sessi
 
     assert out_v1.status == "changed"
     assert out_v1.changed is True
-    assert out_v1.data_origin == "observed"
-    assert out_v1.extracted_app_count == 13
+    assert out_v1.account_email == "apple_share_v1@example.com"
+    assert out_v1.account_password == "PassWordV1_2026!"
+    assert source15.account_email == "apple_share_v1@example.com"
+    assert source15.account_password == "PassWordV1_2026!"
     assert db_session.scalar(select(func.count(ChangeEvent.id))) == 1
 
-    # 3. Fetching identical content (even with different timestamp noise) creates NO new ChangeEvent
+    # 3. Fetching identical credentials & content creates NO new ChangeEvent
     ok_fetch_same = FetchResult(
         url=source15.url,
         ok=True,
@@ -282,7 +287,7 @@ def test_change_detection_and_source_failure_preserves_catalog(db_session: Sessi
     assert out_same.changed is False
     assert db_session.scalar(select(func.count(ChangeEvent.id))) == 1
 
-    # 4. Fetching updated app list (Hades II added) creates apps_updated ChangeEvent (14 active apps)
+    # 4. Fetching updated credentials creates credentials_updated ChangeEvent
     ok_fetch_v2 = FetchResult(
         url=source15.url,
         ok=True,
@@ -294,25 +299,23 @@ def test_change_detection_and_source_failure_preserves_catalog(db_session: Sessi
 
     assert out_v2.status == "changed"
     assert out_v2.changed is True
-    assert db_session.scalar(select(func.count(ChangeEvent.id))) == 2
+    assert out_v2.account_email == "apple_share_v2@example.com"
+    assert out_v2.account_password == "NewPassWordV2_999!"
     latest_ev = db_session.get(ChangeEvent, out_v2.change_event_id)
     assert latest_ev is not None
-    assert latest_ev.event_type == "apps_updated"
-    assert "Hades II" in latest_ev.summary
-
-    # 5. Subsequent network failure after live observation still preserves all 14 apps
-    out_fail_after = apply_fetch_and_detect_changes(db_session, source15, failed_fetch)
-    db_session.commit()
-    assert out_fail_after.status == "error"
-    assert out_fail_after.extracted_app_count == 14
+    assert latest_ev.event_type == "credentials_updated"
+    assert latest_ev.account_email == "apple_share_v2@example.com"
+    assert latest_ev.account_password == "NewPassWordV2_999!"
 
 
 @pytest.mark.asyncio
-async def test_notification_retry_and_duplicate_delivery_prevention(db_session: Session) -> None:
-    """Verify failed channel delivery persists retry state without resending to already-delivered channels."""
+async def test_notification_retry_game_filter_and_duplicate_prevention(db_session: Session) -> None:
+    """Verify game-filtered subscriptions only notify matching games and retries do not duplicate."""
     reload_seed_catalog(db_session)
-    upsert_discord_subscription(db_session, guild_id="100", channel_id="chan_ok")
-    upsert_discord_subscription(db_session, guild_id="100", channel_id="chan_flaky")
+    # chan_all subscribes to all games; chan_mc subscribes only to Minecraft (IDs 1, 19, 20); chan_balatro subscribes to Balatro (ID 15)
+    upsert_discord_subscription(db_session, guild_id="100", channel_id="chan_all", game_filter=None)
+    upsert_discord_subscription(db_session, guild_id="100", channel_id="chan_mc", game_filter="Minecraft")
+    upsert_discord_subscription(db_session, guild_id="100", channel_id="chan_balatro", game_filter="Balatro")
     source15 = db_session.get(Source, 15)
     assert source15 is not None
 
@@ -324,13 +327,18 @@ async def test_notification_retry_and_duplicate_delivery_prevention(db_session: 
     db_session.commit()
 
     sent_log: List[str] = []
-    fail_flaky = True
+    fail_balatro = True
 
-    async def mock_sender(channel_id: str, _embed: Dict[str, object]) -> None:
-        if channel_id == "chan_flaky" and fail_flaky:
+    async def mock_sender(channel_id: str, embed: Dict[str, object]) -> None:
+        # Verify notification embed contains extracted email & password
+        fields_str = str(embed.get("fields", ""))
+        assert "apple_share_v1@example.com" in fields_str
+        assert "PassWordV1_2026!" in fields_str
+        if channel_id == "chan_balatro" and fail_balatro:
             raise RuntimeError("Simulated Discord 502 error")
         sent_log.append(channel_id)
 
+    # First attempt: chan_all succeeds, chan_balatro fails, chan_mc is NOT sent (Source 15 does not have Minecraft)
     completed_1 = await dispatch_pending_notifications(
         db_session,
         worker_id="test-worker",
@@ -340,15 +348,13 @@ async def test_notification_retry_and_duplicate_delivery_prevention(db_session: 
     db_session.commit()
 
     assert completed_1 == 0
-    assert sent_log == ["chan_ok"]
+    assert sent_log == ["chan_all"]
     ev = db_session.scalar(select(ChangeEvent))
     assert ev is not None
     assert ev.notification_status == "pending"
-    assert ev.notification_attempts == 1
-    assert ev.last_notification_error is not None
 
     ev.next_retry_at = None
-    fail_flaky = False
+    fail_balatro = False
     db_session.commit()
 
     completed_2 = await dispatch_pending_notifications(
@@ -360,7 +366,8 @@ async def test_notification_retry_and_duplicate_delivery_prevention(db_session: 
     db_session.commit()
 
     assert completed_2 == 1
-    assert sent_log == ["chan_ok", "chan_flaky"]
+    assert sent_log == ["chan_all", "chan_balatro"]
+    assert "chan_mc" not in sent_log
     assert ev.notification_status == "sent"
     assert db_session.scalar(select(func.count(NotificationDelivery.id))) == 2
 

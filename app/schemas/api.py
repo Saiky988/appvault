@@ -37,6 +37,9 @@ class SourceBriefSchema(BaseModel):
     original_title: str
     display_order: int = 0
     data_origin: str
+    account_email: Optional[str] = None
+    account_password: Optional[str] = None
+    account_updated_at: Optional[datetime] = None
     last_checked_at: Optional[datetime] = None
     last_success_at: Optional[datetime] = None
     last_http_status: Optional[int] = None
@@ -68,6 +71,8 @@ class ChangeEventSchema(BaseModel):
     previous_hash: Optional[str] = None
     current_hash: str
     summary: str
+    account_email: Optional[str] = None
+    account_password: Optional[str] = None
     detected_at: datetime
     notification_status: str
     notification_attempts: int = 0
@@ -106,6 +111,9 @@ class SourceSchema(BaseModel):
     app_count: int = 0
     seed_app_count: int = 0
     observed_app_count: int = 0
+    account_email: Optional[str] = None
+    account_password: Optional[str] = None
+    account_updated_at: Optional[datetime] = None
     last_checked_at: Optional[datetime] = None
     last_success_at: Optional[datetime] = None
     last_http_status: Optional[int] = None
@@ -162,6 +170,8 @@ class SourceCheckOutcomeSchema(BaseModel):
     change_event_id: Optional[int] = None
     extracted_app_count: int = 0
     data_origin: str = "seed"
+    account_email: Optional[str] = None
+    account_password: Optional[str] = None
     error: Optional[str] = None
     checked_at: datetime
 

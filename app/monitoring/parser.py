@@ -1,11 +1,11 @@
-"""HTML parser and content normalizer with strict credential/secret exclusion."""
+"""HTML parser for extracting public account credentials (<div class="copy-buttons">) and catalog metadata."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
 import json
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from bs4 import BeautifulSoup, Comment
 
@@ -16,7 +16,7 @@ from app.core.security import (
 )
 from app.services.catalog import normalize_app_name
 
-# Tags that never belong to public article catalog content
+# Tags removed after extracting copy-buttons input values
 NOISE_TAGS = (
     "script",
     "style",
@@ -35,7 +35,6 @@ NOISE_TAGS = (
     "header",
 )
 
-# Noise class/id substrings (ads, share widgets, timestamps, view counters, comments)
 NOISE_ATTR_TOKENS = (
     "comment",
     "sidebar",
@@ -61,7 +60,6 @@ NOISE_ATTR_TOKENS = (
     "breadcrumb",
 )
 
-# Generic non-app headings/phrases commonly found on Vietnamese/English blogspot instructional posts
 IGNORED_CANDIDATE_PHRASES = (
     "hướng dẫn",
     "huong dan",
@@ -83,6 +81,10 @@ IGNORED_CANDIDATE_PHRASES = (
     "tai khoan",
     "mật khẩu",
     "mat khau",
+    "nhấn nút",
+    "nhan nut",
+    "sao chép",
+    "sao chep",
     "id apple",
     "apple id",
     "app store",
@@ -109,10 +111,8 @@ IGNORED_CANDIDATE_PHRASES = (
     "tai xuong",
     "đã mua",
     "da mua",
-    " không cập nhật",
+    "không cập nhật",
     "khong cap nhat",
-    "sao chép",
-    "sao chep",
     "bài đăng",
     "bai dang",
     "bình luận",
@@ -146,17 +146,58 @@ BULLET_LINE_RE = re.compile(r"^\s*(?:[\-\*\•\+\➢\➤\✓\✔]|\d+[\.\)])\s+(
 DYNAMIC_NOISE_RE = re.compile(
     r"(?i)\b(updated\s+at|last\s+updated|views|lượt\s+xem|posted\s+on)\s*[:\-]?\s*[\d/:,\-\sAPMapm]+"
 )
+EMAIL_INPUT_IDS = {"email", "user", "username", "account", "taikhoan", "tk", "idapple", "appleid"}
+PASSWORD_INPUT_IDS = {"password", "pass", "pwd", "matkhau", "mk"}
 
 
 @dataclass
 class ParsedArticle:
-    """Structured, credential-scrubbed representation of a monitored listing page."""
+    """Structured representation of a monitored listing page including copy-buttons credentials."""
 
     title: str
     apps: List[str] = field(default_factory=list)
     sanitized_body_lines: List[str] = field(default_factory=list)
     content_hash: str = ""
     had_redacted_lines: bool = False
+    account_email: Optional[str] = None
+    account_password: Optional[str] = None
+
+
+def _extract_copy_buttons_credentials(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+    """Extract account email and password from <div class='copy-buttons'> or matching <input> fields."""
+    email_val: Optional[str] = None
+    password_val: Optional[str] = None
+
+    # 1. Inspect <input> tags by id or name attribute
+    for inp in soup.find_all("input"):
+        if inp.attrs is None:
+            continue
+        raw_val = (inp.get("value") or "").strip()
+        if not raw_val:
+            continue
+        ident = f"{inp.get('id') or ''} {inp.get('name') or ''}".strip().lower()
+        ident_clean = re.sub(r"[^a-z0-9]", "", ident)
+        if email_val is None and any(k in ident_clean for k in EMAIL_INPUT_IDS):
+            email_val = raw_val
+        elif password_val is None and any(k in ident_clean for k in PASSWORD_INPUT_IDS):
+            password_val = raw_val
+
+    # 2. Fallback: look inside .copy-buttons container for two consecutive <input value="..."> tags
+    if email_val is None or password_val is None:
+        copy_box = soup.select_one(".copy-buttons")
+        if copy_box is not None:
+            vals = [
+                (inp.get("value") or "").strip()
+                for inp in copy_box.find_all("input")
+                if (inp.get("value") or "").strip()
+            ]
+            if len(vals) >= 2:
+                if email_val is None:
+                    email_val = vals[0]
+                if password_val is None:
+                    password_val = vals[1]
+
+    return email_val, password_val
 
 
 def is_ignored_candidate_title(text: str) -> bool:
@@ -166,14 +207,13 @@ def is_ignored_candidate_title(text: str) -> bool:
     lower = " ".join(text.split()).strip().lower()
     if any(phrase.strip() in lower for phrase in IGNORED_CANDIDATE_PHRASES):
         return True
-    # Reject instructional sentences that end with colons or semicolons
     if lower.endswith((":", ";", "?", "...")):
         return True
     return False
 
 
 def _clean_candidate_app_title(raw: str) -> Optional[str]:
-    """Validate and clean a potential app/game title, returning None if noise or sensitive."""
+    """Validate and clean a potential app/game title, returning None if noise or credential line."""
     if not raw:
         return None
     text = " ".join(raw.split()).strip()
@@ -202,8 +242,11 @@ def compute_stable_content_hash(
     title: str,
     apps: List[str],
     body_lines: List[str],
+    *,
+    account_email: Optional[str] = None,
+    account_password: Optional[str] = None,
 ) -> str:
-    """Compute a deterministic SHA-256 hash over normalized relevant content."""
+    """Compute a deterministic SHA-256 hash over extracted credentials and normalized content."""
     clean_title = " ".join((title or "").split()).strip().lower()
     clean_title = DYNAMIC_NOISE_RE.sub("", clean_title).strip()
 
@@ -226,13 +269,15 @@ def compute_stable_content_hash(
         "title": clean_title,
         "apps": normalized_apps,
         "body": normalized_body[:100],
+        "account_email": (account_email or "").strip(),
+        "account_password": (account_password or "").strip(),
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def parse_public_listing_html(html: str) -> ParsedArticle:
-    """Parse untrusted HTML safely, extracting article title and app list while stripping secrets."""
+    """Parse HTML safely, extracting <div class='copy-buttons'> credentials and any listed apps."""
     if not html or not html.strip():
         return ParsedArticle(title="", apps=[], sanitized_body_lines=[], content_hash="")
 
@@ -243,6 +288,9 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
 
     for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
         comment.extract()
+
+    # Extract <input id="email"> and <input id="password"> BEFORE decomposing input/button tags
+    account_email, account_password = _extract_copy_buttons_credentials(soup)
 
     for tag_name in NOISE_TAGS:
         for tag in soup.find_all(tag_name):
@@ -302,7 +350,6 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
             seen_norms.add(norm)
             extracted_apps.append(cleaned)
 
-    # 1. Explicit data attributes or semantic app-item classes
     for node in container.select("[data-app-title], .app-title, .game-title, .app-item"):
         attr_title = node.get("data-app-title")
         if isinstance(attr_title, str) and attr_title.strip():
@@ -311,14 +358,12 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
             for line in node.get_text("\n", strip=True).splitlines():
                 _try_add_app(line)
 
-    # 2. List items (<li> inside <ul> / <ol>) — split by newline so malformed nested tags don't taint valid lines
     for li in container.find_all("li"):
         if li.find("ul") or li.find("ol"):
             continue
         for line in li.get_text("\n", strip=True).splitlines():
             _try_add_app(line)
 
-    # 3. Bullet lines inside paragraphs or divs
     raw_text_lines = container.get_text("\n", strip=True).splitlines()
     for line in raw_text_lines:
         if contains_sensitive_credentials(line):
@@ -332,7 +377,13 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
     if len(sanitized_lines) < len([ln for ln in raw_text_lines if ln.strip()]):
         had_redacted = True
 
-    content_hash = compute_stable_content_hash(title, extracted_apps, sanitized_lines)
+    content_hash = compute_stable_content_hash(
+        title,
+        extracted_apps,
+        sanitized_lines,
+        account_email=account_email,
+        account_password=account_password,
+    )
 
     return ParsedArticle(
         title=title,
@@ -340,4 +391,6 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
         sanitized_body_lines=sanitized_lines,
         content_hash=content_hash,
         had_redacted_lines=had_redacted,
+        account_email=account_email,
+        account_password=account_password,
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import signal
@@ -50,12 +51,14 @@ class AppVaultBot(discord.Client):
         self.tree.error(self._on_app_command_error)
 
     def compute_command_signature_hash(self) -> str:
-        """Compute deterministic hash of registered slash command names and descriptions."""
-        cmds = sorted(
-            (c.name, getattr(c, "description", ""))
-            for c in self.tree.get_commands()
-        )
-        payload = json.dumps(cmds, sort_keys=True).encode("utf-8")
+        """Compute deterministic hash of registered slash command names, descriptions, and parameters."""
+        entries = []
+        for c in self.tree.get_commands():
+            cb = getattr(c, "callback", None)
+            param_names = list(inspect.signature(cb).parameters.keys()) if callable(cb) else []
+            entries.append((c.name, getattr(c, "description", ""), param_names))
+        entries.sort(key=lambda item: item[0])
+        payload = json.dumps(entries, sort_keys=True).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
     async def setup_hook(self) -> None:

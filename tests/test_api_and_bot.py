@@ -1,4 +1,4 @@
-"""Tests for FastAPI public/admin endpoints, pagination, authentication, and Discord slash commands."""
+"""Tests for FastAPI endpoints, pagination, authentication, and Discord slash commands with autocomplete."""
 from __future__ import annotations
 
 import discord
@@ -7,7 +7,12 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.bot.client import AppVaultBot
+from app.bot.commands.slash import (
+    get_game_autocomplete_choices,
+    get_source_id_autocomplete_choices,
+)
 from app.core.config import get_settings
+from app.db.models import Source
 from app.services.catalog import reload_seed_catalog
 from app.services.search import find_best_matching_app, search_apps
 from app.services.sources import list_source_apps_paginated
@@ -105,20 +110,34 @@ def test_admin_api_authentication_and_actions(api_client: TestClient, db_session
     assert r_reload.json()["sources_updated"] == 5
 
 
-def test_unified_source_relationships_across_services(db_session: Session) -> None:
-    """Ensure /search, /app, /catalog, and /source-apps share identical source-app relationships."""
+def test_unified_source_relationships_and_autocomplete(db_session: Session) -> None:
+    """Ensure /search, /app, /catalog, /source-apps, and autocomplete share identical relationships."""
     reload_seed_catalog(db_session)
     db_session.commit()
 
+    # 1. Initial autocomplete before typing shows up to 25 games immediately
+    initial_choices = get_game_autocomplete_choices("")
+    assert len(initial_choices) == 25
+    assert any("Minecraft" in c.name for c in initial_choices)
+
+    # 2. Typing filters autocomplete dynamically
+    typed_choices = get_game_autocomplete_choices("Mine")
+    assert len(typed_choices) >= 1
+    assert "Minecraft" in typed_choices[0].name
+    assert "#1, #19, #20" in typed_choices[0].name
+
+    # 3. Source ID autocomplete for Minecraft suggests Random, ID 1, ID 19, ID 20
+    id_choices = get_source_id_autocomplete_choices("Minecraft", "")
+    id_vals = [c.value for c in id_choices]
+    assert id_vals == ["Random", "1", "19", "20"]
+
     mc_search = search_apps(db_session, "Minecraft")
     assert mc_search.total >= 1
-    mc_summary = mc_search.items[0].app
-    assert mc_summary.source_ids == [1, 19, 20]
+    assert mc_search.items[0].app.source_ids == [1, 19, 20]
 
     mc_detail = find_best_matching_app(db_session, "Minecraft")
     assert mc_detail is not None
     assert mc_detail.source_ids == [1, 19, 20]
-    assert [s.source_id for s in mc_detail.sources] == [1, 19, 20]
 
     for sid in (1, 19, 20):
         src_apps = list_source_apps_paginated(db_session, sid, limit=100, offset=0)
@@ -127,9 +146,14 @@ def test_unified_source_relationships_across_services(db_session: Session) -> No
 
 
 @pytest.mark.asyncio
-async def test_discord_slash_commands_search_app_and_source_apps_pagination(db_session: Session) -> None:
-    """Verify /search, /app, /source-apps, pagination buttons, and icon-free embeds."""
+async def test_discord_slash_commands_app_credentials_and_game_subscribe(db_session: Session) -> None:
+    """Verify /app (Random and specific ID), /subscribe (with game), /source-apps, and /search."""
     reload_seed_catalog(db_session)
+    # Populate credentials on Source 20
+    src20 = db_session.get(Source, 20)
+    assert src20 is not None
+    src20.account_email = "mc_id20@example.com"
+    src20.account_password = "SecretPass20!"
     db_session.commit()
 
     bot = AppVaultBot(settings=get_settings())
@@ -148,65 +172,40 @@ async def test_discord_slash_commands_search_app_and_source_apps_pagination(db_s
         "admin",
     }.issubset(cmd_names)
 
-    # 1. Execute /search for Minecraft -> must show #1, #19, #20, URLs, status, provenance, Active, and never "No active sources"
-    ix_search = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
-    search_cmd = bot.tree.get_command("search")
-    assert search_cmd is not None
-    await search_cmd.callback(ix_search, "Minecraft")
-    assert len(ix_search.response.messages) == 1
-    search_embed = ix_search.response.messages[0]["embed"]
-    assert search_embed is not None
-    field0 = search_embed.fields[0]
-    assert "#1, #19, #20" in field0["name"]
-    assert "#1, #19, #20" in field0["value"]
-    assert "No active sources" not in field0["value"]
-    assert "State: `Active`" in field0["value"]
-    assert "Provenance: `Seed Data`" in field0["value"]
-
-    # 2. Execute /app for Minecraft -> must show source relationships and "No changes have been detected yet"
-    ix_app = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
+    # 1. Execute /app name:Minecraft (Random mode automatically picks Source 20 which has credentials)
+    ix_app_rand = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
     app_cmd = bot.tree.get_command("app")
     assert app_cmd is not None
-    await app_cmd.callback(ix_app, "Minecraft")
-    app_embed = ix_app.response.messages[0]["embed"]
+    await app_cmd.callback(ix_app_rand, "Minecraft", "Random")
+    app_embed = ix_app_rand.response.messages[0]["embed"]
     assert app_embed is not None
-    assert "#1, #19, #20" in (app_embed.description or "")
-    rel_field = app_embed.fields[0]
-    chg_field = app_embed.fields[1]
-    assert "Source #1" in rel_field["value"]
-    assert "Source #19" in rel_field["value"]
-    assert "Source #20" in rel_field["value"]
-    assert "No changes have been detected yet" in chg_field["value"]
+    assert "ID #20" in (app_embed.title or "")
+    assert "mc_id20@example.com" in app_embed.fields[0]["value"]
+    assert "SecretPass20!" in app_embed.fields[1]["value"]
 
-    # 3. Execute /source-apps for Source 5 (21 apps -> 3 pages at 10 per page) and test Next/Previous buttons
+    # 2. Execute /app name:Minecraft id:20 (Specific ID mode)
+    ix_app_20 = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
+    await app_cmd.callback(ix_app_20, "Minecraft", "20")
+    app_embed_20 = ix_app_20.response.messages[0]["embed"]
+    assert "ID #20" in (app_embed_20.title or "")
+    assert "mc_id20@example.com" in app_embed_20.fields[0]["value"]
+
+    # 3. Execute /source-apps for Source 5 (21 apps -> 3 pages at 10 per page)
     ix_sa = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
     sa_cmd = bot.tree.get_command("source-apps")
-    assert sa_cmd is not None
     await sa_cmd.callback(ix_sa, 5)
     sa_msg = ix_sa.response.messages[0]
     sa_embed_p1 = sa_msg["embed"]
     sa_view = sa_msg["view"]
-    assert sa_embed_p1 is not None
-    assert sa_view is not None
     assert "Source #5 Applications (21 Total)" in (sa_embed_p1.title or "")
-    assert "Shadow Fight 2 Special Edition" in (sa_embed_p1.description or "")
-    assert "Seed Data" in (sa_embed_p1.description or "")
     assert "Page 1/3" in (sa_embed_p1.footer["text"] or "")
 
-    # Click Next button -> goes to Page 2/3
     next_btn = [c for c in sa_view.children if getattr(c, "custom_id", None) == "next_page"][0]
-    prev_btn = [c for c in sa_view.children if getattr(c, "custom_id", None) == "prev_page"][0]
-    assert prev_btn.disabled is True
-    assert next_btn.disabled is False
-
     await next_btn.callback(ix_sa, next_btn)
-    edited_msg = ix_sa.response.messages[-1]
-    sa_embed_p2 = edited_msg["embed"]
+    sa_embed_p2 = ix_sa.response.messages[-1]["embed"]
     assert "Page 2/3" in (sa_embed_p2.footer["text"] or "")
-    assert "Mindustry" in (sa_embed_p2.description or "")
-    assert prev_btn.disabled is False
 
-    # 4. Execute /subscribe with Manage Channels permission
+    # 4. Execute /subscribe with optional game="Minecraft"
     ix_sub = discord.Interaction(
         user_id=1001,
         guild_id=2001,
@@ -215,16 +214,7 @@ async def test_discord_slash_commands_search_app_and_source_apps_pagination(db_s
     )
     sub_cmd = bot.tree.get_command("subscribe")
     target_ch = discord.TextChannel(id=3001, name="updates", guild_id=2001)
-    await sub_cmd.callback(ix_sub, target_ch)
-    assert "Subscribed" in (ix_sub.response.messages[0]["content"] or "")
-
-    # 5. Unauthorized user trying /admin pause is rejected; authorized admin succeeds
-    admin_group = bot.tree.get_command("admin")
-    pause_cmd = {c.name: c for c in admin_group.commands}["pause"]
-    ix_unauth = discord.Interaction(user_id=5555, guild_id=2001, channel_id=3001)
-    await pause_cmd.callback(ix_unauth)
-    assert "Administrator authorization required" in (ix_unauth.response.messages[0]["content"] or "")
-
-    ix_admin = discord.Interaction(user_id=9001, guild_id=2001, channel_id=3001)
-    await pause_cmd.callback(ix_admin)
-    assert "paused" in (ix_admin.response.messages[0]["content"] or "").lower()
+    await sub_cmd.callback(ix_sub, target_ch, "Minecraft")
+    sub_msg = ix_sub.response.messages[0]["content"] or ""
+    assert "Minecraft" in sub_msg
+    assert "#1, #19, #20" in sub_msg

@@ -20,9 +20,8 @@ from app.schemas.api import (
     SourceBriefSchema,
 )
 
-SEED_CATALOG_VERSION = "2026.10.2"
+SEED_CATALOG_VERSION = "2026.10.3"
 
-# Spelling corrections applied ONLY to normalized search fields (never overwriting original_title)
 SPELLING_CORRECTIONS: Dict[str, str] = {
     "subway subfers": "subway surfers",
     "plan vs zombile 2": "plants vs zombies 2",
@@ -31,7 +30,6 @@ SPELLING_CORRECTIONS: Dict[str, str] = {
     "gunsnglory premmium": "guns n glory premium",
 }
 
-# Curated aliases for seed titles (typos, truncated names, common abbreviations)
 CURATED_ALIASES_BY_NORMALIZED_NAME: Dict[str, List[str]] = {
     "subway surfers": ["Subway Surfers", "Subway subfers"],
     "plants vs zombies 2": ["Plants vs. Zombies 2", "Plants vs Zombies 2", "Plan vs Zombile 2", "PvZ 2"],
@@ -52,7 +50,6 @@ CURATED_ALIASES_BY_NORMALIZED_NAME: Dict[str, List[str]] = {
     "naruto ultimate ninja storm": ["Naruto Storm", "Ultimate Ninja Storm"],
 }
 
-# Versioned seed records matching Section 3 exactly (preserving original titles and ordering)
 SEED_SOURCES: Tuple[Dict[str, Any], ...] = (
     {
         "id": 19,
@@ -209,10 +206,7 @@ def ensure_app_and_aliases(
     *,
     platform: str = "iOS",
 ) -> Tuple[App, bool, int]:
-    """Get or create canonical App record by normalized name and attach aliases idempotently.
-
-    Returns (app, created_app, created_aliases_count).
-    """
+    """Get or create canonical App record by normalized name and attach aliases idempotently."""
     clean_title = " ".join((original_title or "").split()).strip()
     if not clean_title or contains_sensitive_credentials(clean_title):
         raise ValueError("Invalid or sensitive app title rejected")
@@ -351,7 +345,6 @@ def reload_seed_catalog(
                 link.is_active = True
                 links_updated += 1
 
-        # Clean up any non-seed links on this source that match instructional/UI boilerplate
         existing_source_links = session.scalars(
             select(SourceApp).where(SourceApp.source_id == source.id)
         ).all()
@@ -406,6 +399,9 @@ def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSche
                 original_title=link.original_title,
                 display_order=link.display_order,
                 data_origin=link.data_origin,
+                account_email=src.account_email,
+                account_password=src.account_password,
+                account_updated_at=src.account_updated_at,
                 last_checked_at=src.last_checked_at,
                 last_success_at=src.last_success_at,
                 last_http_status=src.last_http_status,
@@ -488,6 +484,8 @@ def get_app_detail(session: Session, app_id: int) -> Optional[AppDetailSchema]:
                     previous_hash=ev.previous_hash,
                     current_hash=ev.current_hash,
                     summary=ev.summary,
+                    account_email=ev.account_email or (src.account_email if src else None),
+                    account_password=ev.account_password or (src.account_password if src else None),
                     detected_at=ev.detected_at,
                     notification_status=ev.notification_status,
                     notification_attempts=ev.notification_attempts,

@@ -29,13 +29,15 @@ def build_engine(database_url: Optional[str] = None, settings: Optional[Settings
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             if ":memory:" not in url:
-                cursor.execute("PRAGMA journal_mode=WAL")
-                cursor.execute("PRAGMA synchronous=NORMAL")
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA synchronous=NORMAL")
+                except Exception:
+                    pass
             cursor.close()
 
         return engine
 
-    # PostgreSQL configuration
     return create_engine(
         url,
         pool_pre_ping=True,
@@ -83,10 +85,30 @@ def configure_database(database_url: str) -> Engine:
     return _engine
 
 
+def _ensure_schema_columns(engine: Engine) -> None:
+    """Idempotently add newly introduced columns on existing databases without losing data."""
+    alter_statements = [
+        ("sources", "account_email", "VARCHAR(255)"),
+        ("sources", "account_password", "VARCHAR(255)"),
+        ("sources", "account_updated_at", "TIMESTAMP"),
+        ("change_events", "account_email", "VARCHAR(255)"),
+        ("change_events", "account_password", "VARCHAR(255)"),
+        ("discord_subscriptions", "game_filter", "VARCHAR(255)"),
+    ]
+    for table_name, col_name, col_type in alter_statements:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"))
+        except Exception:
+            # Column already exists
+            pass
+
+
 def init_db(engine: Optional[Engine] = None) -> None:
-    """Ensure all database tables exist."""
+    """Ensure all database tables and columns exist."""
     target_engine = engine or get_engine()
     Base.metadata.create_all(bind=target_engine)
+    _ensure_schema_columns(target_engine)
 
 
 def check_db_health(session: Optional[Session] = None) -> bool:

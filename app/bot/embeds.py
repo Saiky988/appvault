@@ -14,6 +14,7 @@ from app.schemas.api import (
     AppSummarySchema,
     ChangeEventSchema,
     SourceAppItemSchema,
+    SourceBriefSchema,
     SourceCheckOutcomeSchema,
     SourceSchema,
     StatsResponseSchema,
@@ -52,7 +53,7 @@ def build_search_embed(
     page: int = 1,
     per_page: int = 5,
 ) -> discord.Embed:
-    """Build a paginated, icon-free embed for /search results showing all matching source IDs."""
+    """Build a paginated, icon-free embed for /search results showing all matching source IDs and credentials."""
     total_items = len(search_resp.items)
     total_pages = max(1, math.ceil(total_items / per_page))
     safe_page = max(1, min(page, total_pages))
@@ -84,10 +85,15 @@ def build_search_embed(
 
         src_lines: List[str] = []
         for s in app.sources:
+            cred_part = (
+                f"\n  Account: `{s.account_email}` | Password: `{s.account_password}`"
+                if (s.account_email or s.account_password)
+                else ""
+            )
             src_lines.append(
                 f"- **Source #{s.source_id}** | State: `{_active_label(s.enabled)}` | "
                 f"Health: `{_health_label(s.health_status)}` | "
-                f"Provenance: `{_origin_label(s.data_origin)}`\n"
+                f"Provenance: `{_origin_label(s.data_origin)}`{cred_part}\n"
                 f"  Checked: `{_fmt_dt(s.last_checked_at)}` | [Source #{s.source_id} URL]({s.url})"
             )
 
@@ -101,7 +107,7 @@ def build_search_embed(
         value_text = header_meta + "\n".join(src_lines)
 
         embed.add_field(
-            name=f"{redact_sensitive_text(app.canonical_name)} [Sources: {source_ids_display}]",
+            name=f"{app.canonical_name} [Sources: {source_ids_display}]",
             value=value_text[:1024],
             inline=False,
         )
@@ -110,56 +116,80 @@ def build_search_embed(
     return embed
 
 
-def build_app_detail_embed(detail: AppDetailSchema) -> discord.Embed:
-    """Build a detailed, icon-free embed for /app name:<text>."""
+def build_app_detail_embed(
+    detail: AppDetailSchema,
+    *,
+    selected_source: Optional[SourceBriefSchema] = None,
+    selection_mode: str = "random",
+) -> discord.Embed:
+    """Build an icon-free embed for /app showing the selected ID's account & password plus source relationships."""
     all_source_ids = [s.source_id for s in detail.sources] or list(detail.source_ids)
     source_ids_str = ", ".join(f"#{sid}" for sid in all_source_ids) if all_source_ids else "None"
-    aliases_str = ", ".join(f"`{a}`" for a in detail.aliases[:10]) if detail.aliases else "None"
+    aliases_str = ", ".join(f"`{a}`" for a in detail.aliases[:8]) if detail.aliases else "None"
+
+    chosen = selected_source or (detail.sources[0] if detail.sources else None)
+    title_suffix = f" — ID #{chosen.source_id}" if chosen else ""
 
     embed = discord.Embed(
-        title=f"Application Details: {redact_sensitive_text(detail.canonical_name)}",
+        title=f"{detail.canonical_name}{title_suffix}",
+        url=chosen.url if chosen else None,
         description=(
-            f"**Catalog App ID**: `#{detail.id}`\n"
-            f"**Normalized Name**: `{detail.normalized_name}`\n"
-            f"**Platform**: `{detail.platform or 'iOS'}`\n"
-            f"**Associated Source IDs**: {source_ids_str}\n"
-            f"**Aliases**: {aliases_str}"
+            f"**Game**: `{detail.canonical_name}`\n"
+            f"**Available IDs**: {source_ids_str}"
+            + (f" (Selected: `ID #{chosen.source_id}` via `{selection_mode}`)" if chosen else "")
+            + f"\n**Aliases**: {aliases_str}"
         ),
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc),
     )
 
+    if chosen is not None:
+        email_display = chosen.account_email or "Chua cap nhat (Hay chay /check)"
+        pass_display = chosen.account_password or "Chua cap nhat (Hay chay /check)"
+        embed.add_field(
+            name=f"Tai Khoan (ID #{chosen.source_id})",
+            value=f"```\n{email_display}\n```",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"Mat Khau (ID #{chosen.source_id})",
+            value=f"```\n{pass_display}\n```",
+            inline=False,
+        )
+        embed.add_field(
+            name="Selected ID Status",
+            value=(
+                f"ID: `#{chosen.source_id}` | State: `{_active_label(chosen.enabled)}` | "
+                f"Health: `{_health_label(chosen.health_status)}`\n"
+                f"Updated: `{_fmt_dt(chosen.account_updated_at or chosen.last_success_at)}` | "
+                f"[Open ID #{chosen.source_id} Page]({chosen.url})"
+            ),
+            inline=False,
+        )
+
     if detail.sources:
         src_lines: List[str] = []
         for s in detail.sources:
-            err_note = (
-                f"\n  Last Error: `{redact_sensitive_text(s.last_error)[:90]}`"
-                if s.last_error
-                else ""
+            cred_status = (
+                f"Account: `{s.account_email}`"
+                if s.account_email
+                else f"Provenance: `{_origin_label(s.data_origin)}`"
             )
             src_lines.append(
-                f"- **Source #{s.source_id}** (Listed as: `{redact_sensitive_text(s.original_title)}`)\n"
-                f"  State: `{_active_label(s.enabled)}` | Health: `{_health_label(s.health_status)}` | "
-                f"Provenance: `{_origin_label(s.data_origin)}`\n"
-                f"  Last Checked: `{_fmt_dt(s.last_checked_at)}` | Last Success: `{_fmt_dt(s.last_success_at)}`\n"
-                f"  URL: [Source #{s.source_id} Page]({s.url}){err_note}"
+                f"- **Source #{s.source_id}** (Listed as: `{s.original_title}`)\n"
+                f"  State: `{_active_label(s.enabled)}` | Health: `{_health_label(s.health_status)}` | {cred_status}\n"
+                f"  Last Checked: `{_fmt_dt(s.last_checked_at)}` | [Source #{s.source_id} Page]({s.url})"
             )
         embed.add_field(
             name=f"Source Relationships ({len(detail.sources)})",
             value="\n".join(src_lines)[:1024],
             inline=False,
         )
-    else:
-        embed.add_field(
-            name="Source Relationships (0)",
-            value="No associated sources registered in catalog.",
-            inline=False,
-        )
 
     if detail.recent_changes:
         chg_lines = [
             f"- `{_fmt_dt(c.detected_at)}` [**Source #{c.source_id}** `{c.event_type}`]: "
-            f"{redact_sensitive_text(c.summary)[:120]}"
+            f"{c.summary[:120]}"
             for c in detail.recent_changes[:5]
         ]
         embed.add_field(
@@ -193,7 +223,7 @@ def build_source_apps_embed(
     items = source_apps[start : start + per_page]
 
     app_lines = [
-        f"`{idx:02d}.` **{redact_sensitive_text(item.original_title)}** "
+        f"`{idx:02d}.` **{item.original_title}** "
         f"— Provenance: `{_origin_label(item.data_origin)}`"
         for idx, item in enumerate(items, start=start + 1)
     ]
@@ -206,6 +236,11 @@ def build_source_apps_embed(
         f"**Last Successful Fetch**: `{_fmt_dt(source.last_success_at)}`\n"
         f"**Total Apps**: `{total}` (Seed: `{source.seed_app_count}`, Observed: `{source.observed_app_count}`)"
     )
+    if source.account_email or source.account_password:
+        header_block += (
+            f"\n**Tai Khoan**: `{source.account_email or 'N/A'}` | "
+            f"**Mat Khau**: `{source.account_password or 'N/A'}`"
+        )
     if source.last_error:
         header_block += f"\n**Last Error**: `{redact_sensitive_text(source.last_error)[:140]}`"
 
@@ -250,10 +285,10 @@ def build_catalog_embed(
     for a in items_all:
         sids = [s.source_id for s in a.sources] or list(a.source_ids)
         sources_text = ", ".join(f"`#{sid}`" for sid in sids) if sids else "None"
-        origins = sorted({ _origin_label(s.data_origin) for s in a.sources })
+        origins = sorted({_origin_label(s.data_origin) for s in a.sources})
         origin_text = f" ({', '.join(origins)})" if origins else ""
         lines.append(
-            f"- **{redact_sensitive_text(a.canonical_name)}** — Source IDs: {sources_text}{origin_text}"
+            f"- **{a.canonical_name}** — Source IDs: {sources_text}{origin_text}"
         )
 
     embed = discord.Embed(
@@ -279,6 +314,17 @@ def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
         ),
         timestamp=datetime.now(timezone.utc),
     )
+    if source.account_email or source.account_password:
+        embed.add_field(
+            name="Tai Khoan (Email)",
+            value=f"```\n{source.account_email or 'N/A'}\n```",
+            inline=False,
+        )
+        embed.add_field(
+            name="Mat Khau (Password)",
+            value=f"```\n{source.account_password or 'N/A'}\n```",
+            inline=False,
+        )
     embed.add_field(name="Health Status", value=f"`{_health_label(source.health_status)}`", inline=True)
     embed.add_field(name="State", value=f"`{_active_label(source.enabled)}`", inline=True)
     embed.add_field(
@@ -318,29 +364,60 @@ def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
     return embed
 
 
-def build_updates_embed(events: Sequence[ChangeEventSchema], limit: int) -> discord.Embed:
-    """Build an icon-free embed for /updates [limit]."""
+def build_updates_embed(
+    events: Sequence[ChangeEventSchema],
+    limit: int,
+    *,
+    sources: Optional[Sequence[SourceSchema]] = None,
+    game_query: Optional[str] = None,
+) -> discord.Embed:
+    """Build an icon-free embed for /updates showing latest account credentials and change events."""
+    title_str = f"Recent Account Updates (Limit: {limit})"
+    if game_query:
+        title_str += f" — Filter: {game_query}"
+
     embed = discord.Embed(
-        title=f"Recent Detected Changes (Limit: {limit})",
+        title=title_str,
         description=(
-            "No change events have been detected yet."
-            if not events
-            else f"Showing **{len(events)}** recent event(s):"
+            f"Showing **{len(events)}** recent update event(s):"
+            if events
+            else "No change events recorded yet. Showing current source account snapshots below:"
         ),
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
-    for ev in events[:10]:
-        link_part = f" | [Source Link]({ev.source_url})" if ev.source_url else ""
-        embed.add_field(
-            name=f"Event #{ev.id} | Source #{ev.source_id} ({ev.event_type})",
-            value=(
-                f"{redact_sensitive_text(ev.summary)[:400]}\n"
-                f"Detected: `{_fmt_dt(ev.detected_at)}` | Notification: `{ev.notification_status}`{link_part}"
-            )[:1024],
-            inline=False,
-        )
-    embed.set_footer(text="AppVault Change Log")
+
+    if events:
+        for ev in events[:10]:
+            link_part = f" | [Source Link]({ev.source_url})" if ev.source_url else ""
+            cred_lines = ""
+            if ev.account_email or ev.account_password:
+                cred_lines = (
+                    f"Tai Khoan: `{ev.account_email or 'N/A'}`\n"
+                    f"Mat Khau: `{ev.account_password or 'N/A'}`\n"
+                )
+            embed.add_field(
+                name=f"Event #{ev.id} | ID #{ev.source_id} ({ev.event_type})",
+                value=(
+                    f"{cred_lines}"
+                    f"{ev.summary[:300]}\n"
+                    f"Updated: `{_fmt_dt(ev.detected_at)}` | Status: `{ev.notification_status}`{link_part}"
+                )[:1024],
+                inline=False,
+            )
+    elif sources:
+        for src in sources[:10]:
+            embed.add_field(
+                name=f"ID #{src.id} | State: {_active_label(src.enabled)} ({_health_label(src.health_status)})",
+                value=(
+                    f"Tai Khoan: `{src.account_email or 'Chua cap nhat'}`\n"
+                    f"Mat Khau: `{src.account_password or 'Chua cap nhat'}`\n"
+                    f"Updated: `{_fmt_dt(src.account_updated_at or src.last_success_at)}` | [Open Page]({src.url})"
+                )[:1024],
+                inline=False,
+            )
+
+    embed.set_footer(text="AppVault Account Updates")
     return embed
 
 
@@ -405,6 +482,17 @@ def build_check_outcome_embed(outcome: SourceCheckOutcomeSchema) -> discord.Embe
         color=discord.Color.green() if is_ok else discord.Color.orange(),
         timestamp=outcome.checked_at,
     )
+    if outcome.account_email or outcome.account_password:
+        embed.add_field(
+            name="Tai Khoan (Email)",
+            value=f"```\n{outcome.account_email or 'N/A'}\n```",
+            inline=False,
+        )
+        embed.add_field(
+            name="Mat Khau (Password)",
+            value=f"```\n{outcome.account_password or 'N/A'}\n```",
+            inline=False,
+        )
     embed.add_field(name="Outcome", value=f"`{outcome.status}`", inline=True)
     embed.add_field(
         name="HTTP Status",

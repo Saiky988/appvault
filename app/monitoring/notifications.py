@@ -1,9 +1,9 @@
-"""Persistent Discord notification dispatcher with DB-backed lease, backoff retries, and per-channel deduplication."""
+"""Persistent Discord notification dispatcher with DB-backed lease, backoff retries, and game-filtered subscriptions."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Set
 
 import httpx
 from sqlalchemy import select
@@ -11,36 +11,68 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.security import redact_sensitive_text
-from app.db.models import ChangeEvent, DiscordSubscription, NotificationDelivery, Source
+from app.db.models import App, ChangeEvent, DiscordSubscription, NotificationDelivery, Source, SourceApp
 
 logger = logging.getLogger("appvault.notifications")
 
-# Optional callback signature: async def send_fn(channel_id: str, embed_dict: Dict[str, Any]) -> None
 DiscordSenderFunc = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
-def build_change_notification_embed_dict(event: ChangeEvent, source: Optional[Source]) -> Dict[str, Any]:
-    """Construct a safe, secret-scrubbed, icon-free Discord embed payload for a ChangeEvent."""
-    safe_summary = redact_sensitive_text(event.summary or "Source update detected.")
+def _get_source_apps_and_norms(session: Session, source_id: int) -> tuple[List[str], Set[str]]:
+    """Return (display_titles, normalized_names) for all active apps on a source."""
+    links = session.scalars(
+        select(SourceApp)
+        .where(SourceApp.source_id == source_id, SourceApp.is_active == True)  # noqa: E712
+        .order_by(SourceApp.display_order.asc())
+    ).all()
+    titles: List[str] = []
+    norms: Set[str] = set()
+    for lk in links:
+        titles.append(lk.original_title)
+        app_obj = session.get(App, lk.app_id)
+        if app_obj:
+            norms.add(app_obj.normalized_name)
+    return titles, norms
+
+
+def build_change_notification_embed_dict(
+    event: ChangeEvent,
+    source: Optional[Source],
+    game_titles: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Construct an icon-free Discord embed payload for a ChangeEvent including account credentials."""
     source_url = source.url if source else None
-    source_label = f"Source #{event.source_id}" + (f" (ID {source.source_key})" if source else "")
+    source_label = f"ID #{event.source_id}" + (f" (Key {source.source_key})" if source else "")
+    email_val = event.account_email or (source.account_email if source else None) or "N/A"
+    pass_val = event.account_password or (source.account_password if source else None) or "N/A"
+
+    fields: List[Dict[str, Any]] = [
+        {"name": "ID", "value": f"`#{event.source_id}`", "inline": True},
+        {"name": "Event", "value": f"`{event.event_type}`", "inline": True},
+        {"name": "Tai Khoan (Email)", "value": f"```\n{email_val}\n```", "inline": False},
+        {"name": "Mat Khau (Password)", "value": f"```\n{pass_val}\n```", "inline": False},
+    ]
+
+    if game_titles:
+        preview = ", ".join(game_titles[:12])
+        if len(game_titles) > 12:
+            preview += f" (+{len(game_titles) - 12} more)"
+        fields.append(
+            {
+                "name": f"Games in ID #{event.source_id} ({len(game_titles)})",
+                "value": preview[:1024],
+                "inline": False,
+            }
+        )
 
     return {
-        "title": f"AppVault Update — {source_label}",
-        "description": safe_summary[:2000],
+        "title": f"Account Update — {source_label}",
+        "description": (event.summary or "Updated account credentials.")[:2000],
         "url": source_url,
-        "color": 0x2ECC71 if event.event_type in ("apps_updated", "initial_observation") else 0x3498DB,
+        "color": 0x2ECC71 if event.event_type in ("credentials_updated", "apps_updated", "initial_observation") else 0x3498DB,
         "timestamp": event.detected_at.astimezone(timezone.utc).isoformat(),
-        "fields": [
-            {"name": "Event Type", "value": f"`{event.event_type}`", "inline": True},
-            {"name": "Source ID", "value": f"`{event.source_id}`", "inline": True},
-            {
-                "name": "Content Hash",
-                "value": f"`{event.current_hash[:12]}...`",
-                "inline": True,
-            },
-        ],
-        "footer": {"text": "AppVault Monitor | Credentials & sensitive data excluded"},
+        "fields": fields,
+        "footer": {"text": f"AppVault Monitor | ID #{event.source_id}"},
     }
 
 
@@ -116,6 +148,29 @@ def acquire_event_notification_lease(
     return True
 
 
+def _subscription_matches_event(
+    sub: DiscordSubscription,
+    event: ChangeEvent,
+    source_app_norms: Set[str],
+) -> bool:
+    """Return True if a subscription matches both the event type and optional game filter."""
+    types_raw = (sub.subscribed_event_types or "all").lower()
+    subscribed_set = {t.strip() for t in types_raw.split(",") if t.strip()}
+    if "all" not in subscribed_set and event.event_type.lower() not in subscribed_set:
+        if event.event_type.lower() != "credentials_updated":
+            return False
+
+    game_filter_raw = (sub.game_filter or "").strip().lower()
+    if not game_filter_raw or game_filter_raw == "all":
+        return True
+
+    filter_norms = {g.strip() for g in game_filter_raw.split(",") if g.strip()}
+    for fn in filter_norms:
+        if fn in source_app_norms or any(fn in sn for sn in source_app_norms):
+            return True
+    return False
+
+
 async def dispatch_pending_notifications(
     session: Session,
     *,
@@ -123,10 +178,7 @@ async def dispatch_pending_notifications(
     sender: Optional[DiscordSenderFunc] = None,
     settings: Optional[Settings] = None,
 ) -> int:
-    """Dispatch pending ChangeEvents to enabled DiscordSubscriptions with retry backoff and deduplication.
-
-    Returns the number of ChangeEvents marked as 'sent' or 'skipped'.
-    """
+    """Dispatch pending ChangeEvents to enabled DiscordSubscriptions with retry backoff and deduplication."""
     cfg = settings or get_settings()
     send_fn = sender or (lambda ch_id, emb: default_discord_rest_sender(ch_id, emb, settings=cfg))
 
@@ -152,12 +204,12 @@ async def dispatch_pending_notifications(
         if not acquire_event_notification_lease(session, event, worker_id):
             continue
 
-        matching_subs: List[DiscordSubscription] = []
-        for sub in active_subscriptions:
-            types_raw = (sub.subscribed_event_types or "all").lower()
-            subscribed_set = {t.strip() for t in types_raw.split(",") if t.strip()}
-            if "all" in subscribed_set or event.event_type.lower() in subscribed_set:
-                matching_subs.append(sub)
+        game_titles, source_app_norms = _get_source_apps_and_norms(session, event.source_id)
+        matching_subs = [
+            sub
+            for sub in active_subscriptions
+            if _subscription_matches_event(sub, event, source_app_norms)
+        ]
 
         if not matching_subs:
             event.notification_status = "pending"
@@ -167,7 +219,7 @@ async def dispatch_pending_notifications(
             continue
 
         source = session.get(Source, event.source_id)
-        embed_dict = build_change_notification_embed_dict(event, source)
+        embed_dict = build_change_notification_embed_dict(event, source, game_titles=game_titles)
 
         already_delivered_channels = set(
             session.scalars(
