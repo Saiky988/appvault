@@ -13,7 +13,9 @@ from app.db.models import Base
 _engine: Optional[Engine] = None
 _session_factory: Optional[Any] = None
 
+
 def build_engine(database_url: Optional[str] = None, settings: Optional[Settings] = None) -> Engine:
+    """Create a configured SQLAlchemy Engine supporting both SQLite and PostgreSQL."""
     cfg = settings or get_settings()
     url = database_url or cfg.database_url
 
@@ -44,13 +46,17 @@ def build_engine(database_url: Optional[str] = None, settings: Optional[Settings
         future=True,
     )
 
+
 def get_engine() -> Engine:
+    """Return singleton SQLAlchemy Engine for current process."""
     global _engine
     if _engine is None:
         _engine = build_engine()
     return _engine
 
+
 def get_session_factory() -> Any:
+    """Return singleton sessionmaker bound to process engine."""
     global _session_factory
     if _session_factory is None:
         _session_factory = sessionmaker(
@@ -62,7 +68,9 @@ def get_session_factory() -> Any:
         )
     return _session_factory
 
+
 def configure_database(database_url: str) -> Engine:
+    """Reconfigure database engine and sessionmaker (useful for isolated tests)."""
     global _engine, _session_factory
     if _engine is not None:
         _engine.dispose()
@@ -76,7 +84,9 @@ def configure_database(database_url: str) -> Engine:
     )
     return _engine
 
+
 def _ensure_schema_columns(engine: Engine) -> None:
+    """Idempotently add newly introduced columns on existing databases without losing data."""
     alter_statements = [
         ("apps", "icon_url", "VARCHAR(1024)"),
         ("sources", "account_email", "VARCHAR(255)"),
@@ -93,12 +103,16 @@ def _ensure_schema_columns(engine: Engine) -> None:
         except Exception:
             pass
 
+
 def init_db(engine: Optional[Engine] = None) -> None:
+    """Ensure all database tables and columns exist."""
     target_engine = engine or get_engine()
     Base.metadata.create_all(bind=target_engine)
     _ensure_schema_columns(target_engine)
 
+
 def check_db_health(session: Optional[Session] = None) -> bool:
+    """Verify database connectivity with a lightweight SELECT 1 query."""
     try:
         if session is not None:
             session.execute(text("SELECT 1"))
@@ -109,8 +123,10 @@ def check_db_health(session: Optional[Session] = None) -> bool:
     except Exception:
         return False
 
+
 @contextmanager
 def session_scope() -> Generator[Session, None, None]:
+    """Transactional context manager for scripts, bot commands, and background workers."""
     factory = get_session_factory()
     session: Session = factory()
     try:
@@ -122,7 +138,9 @@ def session_scope() -> Generator[Session, None, None]:
     finally:
         session.close()
 
+
 def get_db_session() -> Generator[Session, None, None]:
+    """FastAPI dependency yielding a database Session per request."""
     factory = get_session_factory()
     session: Session = factory()
     try:

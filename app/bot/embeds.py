@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import math
+import random
 from typing import Callable, List, Optional, Sequence
 
 import discord
@@ -20,6 +21,10 @@ from app.schemas.api import (
     StatsResponseSchema,
 )
 
+DONATE_IMAGE_URL = "https://raw.nvirya.com/assets/donate.jpeg"
+DONATE_MIN_PROB = 0.15
+DONATE_MAX_PROB = 0.35
+
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
     if dt is None:
@@ -27,6 +32,39 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+
+
+def should_trigger_donate_prompt(
+    *,
+    roll: Optional[float] = None,
+    probability: Optional[float] = None,
+) -> bool:
+    """Return True with a 15%–35% random probability to attach the donate prompt embed."""
+    target_prob = (
+        probability
+        if probability is not None
+        else random.uniform(DONATE_MIN_PROB, DONATE_MAX_PROB)  # noqa: S311
+    )
+    actual_roll = roll if roll is not None else random.random()  # noqa: S311
+    return actual_roll < target_prob
+
+
+def build_donate_embed() -> discord.Embed:
+    """Build the VietQR donate embed."""
+    embed = discord.Embed(
+        title="☕ Ủng hộ chủ thớt duy trì nhé!",
+        description=(
+            "Bot chạy tốn cơm tốn gạo với tiền duy trì server quá ae ơi cứu với..\n"
+            "Nếu tải được game xịn xò thì hoan hỉ ủng hộ chủ thớt "
+            "chút đỉnh tiền mì gói qua VietQR bên dưới nhé:\n\n"
+            "**STK:** `3766773667`\n"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_image(url=DONATE_IMAGE_URL)
+    embed.set_footer(text="AppVault • Cảm ơn ae đã ủng hộ!")
+    return embed
 
 
 def build_search_embed(
@@ -63,7 +101,6 @@ def build_search_embed(
             else "Chưa có"
         )
 
-        # Pick the first source that has credentials to preview, or the first available source
         with_creds = [s for s in app.sources if s.account_email and s.account_password]
         preview_src = with_creds[0] if with_creds else (app.sources[0] if app.sources else None)
 
@@ -87,8 +124,9 @@ def build_app_detail_embed(
     *,
     selected_source: Optional[SourceBriefSchema] = None,
     selection_mode: str = "random",
+    icon_url: Optional[str] = None,
 ) -> discord.Embed:
-    """Build a concise, production-ready embed for /app using single backticks for easy mobile copy."""
+    """Build a concise, production-ready embed for /app with 512px thumbnail icon and single backticks."""
     all_source_ids = [s.source_id for s in detail.sources] or list(detail.source_ids)
     source_ids_str = ", ".join(f"#{sid}" for sid in all_source_ids) if all_source_ids else "Chưa có"
 
@@ -104,6 +142,10 @@ def build_app_detail_embed(
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc),
     )
+
+    effective_icon = icon_url or detail.icon_url
+    if effective_icon:
+        embed.set_thumbnail(url=effective_icon)
 
     if chosen is not None:
         email_display = chosen.account_email or "Đang cập nhật"

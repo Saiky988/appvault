@@ -158,9 +158,12 @@ SEED_SOURCES: Tuple[Dict[str, Any], ...] = (
     },
 )
 
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
+
 def normalize_raw_title(text: str) -> str:
+    """Normalize text into lowercase alphanumeric tokens without applying spelling corrections."""
     if not text:
         return ""
     pre_cleaned = (
@@ -178,7 +181,9 @@ def normalize_raw_title(text: str) -> str:
     tokens = _NON_ALNUM_RE.sub(" ", ascii_str).split()
     return " ".join(tokens)
 
+
 def normalize_app_name(title: str, *, apply_spelling_fixes: bool = True) -> str:
+    """Normalize an app title for deduplication and search, applying known spelling corrections."""
     raw_norm = normalize_raw_title(title)
     if not raw_norm:
         return ""
@@ -186,11 +191,13 @@ def normalize_app_name(title: str, *, apply_spelling_fixes: bool = True) -> str:
         return SPELLING_CORRECTIONS[raw_norm]
     return raw_norm
 
+
 async def fetch_itunes_artwork_512(
     search_term: str,
     *,
     transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> Optional[str]:
+    """Query Apple iTunes Search API for a game/app and return its artworkUrl512."""
     cleaned_term = (search_term or "").strip()
     if not cleaned_term:
         return None
@@ -241,7 +248,9 @@ async def fetch_itunes_artwork_512(
         return None
     return None
 
+
 def compute_source_health_status(source: Source) -> str:
+    """Return human-readable health status for a Source."""
     if not source.enabled:
         return "disabled"
     if source.last_error:
@@ -250,12 +259,14 @@ def compute_source_health_status(source: Source) -> str:
         return "healthy"
     return "seed_only"
 
+
 def ensure_app_and_aliases(
     session: Session,
     original_title: str,
     *,
     platform: str = "iOS",
 ) -> Tuple[App, bool, int]:
+    """Get or create canonical App record by normalized name and attach aliases idempotently."""
     clean_title = " ".join((original_title or "").split()).strip()
     if not clean_title or contains_sensitive_credentials(clean_title):
         raise ValueError("Invalid or sensitive app title rejected")
@@ -315,10 +326,12 @@ def ensure_app_and_aliases(
     session.flush()
     return existing_app, created_app, created_aliases
 
+
 def reload_seed_catalog(
     session: Session,
     seed_sources: Sequence[Dict[str, Any]] = SEED_SOURCES,
 ) -> CatalogReloadResponseSchema:
+    """Idempotently load or reload the versioned seed catalog and clean up any stray instructional rows."""
     from app.monitoring.parser import is_ignored_candidate_title
 
     sources_created = 0
@@ -431,10 +444,12 @@ def reload_seed_catalog(
         aliases_created=aliases_created,
     )
 
+
 def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSchema]:
+    """Return all active SourceBriefSchema records associated with an App (authoritative shared query)."""
     links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.app_id == app_id, SourceApp.is_active == True)
+        .where(SourceApp.app_id == app_id, SourceApp.is_active == True)  # noqa: E712
         .order_by(SourceApp.source_id.asc(), SourceApp.display_order.asc())
     ).all()
 
@@ -471,7 +486,9 @@ def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSche
         )
     return source_briefs
 
+
 def build_app_summary(session: Session, app: App) -> AppSummarySchema:
+    """Hydrate an AppSummarySchema with its linked sources, icon_url, and aliases."""
     source_briefs = get_app_source_briefs(session, app.id)
     source_ids = [s.source_id for s in source_briefs]
 
@@ -494,12 +511,14 @@ def build_app_summary(session: Session, app: App) -> AppSummarySchema:
         updated_at=app.updated_at,
     )
 
+
 def list_apps_paginated(
     session: Session,
     *,
     limit: int = 20,
     offset: int = 0,
 ) -> PaginatedResponse[AppSummarySchema]:
+    """Return paginated canonical apps ordered alphabetically."""
     total = int(session.scalar(select(func.count(App.id))) or 0)
     apps = session.scalars(
         select(App)
@@ -515,7 +534,9 @@ def list_apps_paginated(
         items=items,
     )
 
+
 def get_app_detail(session: Session, app_id: int) -> Optional[AppDetailSchema]:
+    """Return full details for a single App including source links and recent change history."""
     app = session.get(App, app_id)
     if app is None:
         return None

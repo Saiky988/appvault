@@ -152,8 +152,11 @@ DYNAMIC_NOISE_RE = re.compile(
 EMAIL_INPUT_IDS = {"email", "user", "username", "account", "taikhoan", "tk", "idapple", "appleid"}
 PASSWORD_INPUT_IDS = {"password", "pass", "pwd", "matkhau", "mk"}
 
+
 @dataclass
 class ParsedArticle:
+    """Structured representation of a monitored listing page including copy-buttons credentials."""
+
     title: str
     apps: List[str] = field(default_factory=list)
     sanitized_body_lines: List[str] = field(default_factory=list)
@@ -162,7 +165,9 @@ class ParsedArticle:
     account_email: Optional[str] = None
     account_password: Optional[str] = None
 
+
 def _extract_copy_buttons_credentials(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+    """Extract account email and password from <div class='copy-buttons'> or matching <input> fields."""
     email_val: Optional[str] = None
     password_val: Optional[str] = None
 
@@ -195,7 +200,9 @@ def _extract_copy_buttons_credentials(soup: BeautifulSoup) -> Tuple[Optional[str
 
     return email_val, password_val
 
+
 def is_ignored_candidate_title(text: str) -> bool:
+    """Return True if text matches known instructional phrases or non-app UI boilerplate."""
     if not text:
         return True
     lower = " ".join(text.split()).strip().lower()
@@ -205,7 +212,9 @@ def is_ignored_candidate_title(text: str) -> bool:
         return True
     return False
 
+
 def _clean_candidate_app_title(raw: str) -> Optional[str]:
+    """Validate and clean a potential app/game title, returning None if noise or credential line."""
     if not raw:
         return None
     text = " ".join(raw.split()).strip()
@@ -229,6 +238,7 @@ def _clean_candidate_app_title(raw: str) -> Optional[str]:
         return None
     return text
 
+
 def compute_stable_content_hash(
     title: str,
     apps: List[str],
@@ -237,6 +247,7 @@ def compute_stable_content_hash(
     account_email: Optional[str] = None,
     account_password: Optional[str] = None,
 ) -> str:
+    """Compute a deterministic SHA-256 hash over extracted credentials and normalized content."""
     clean_title = " ".join((title or "").split()).strip().lower()
     clean_title = DYNAMIC_NOISE_RE.sub("", clean_title).strip()
 
@@ -265,7 +276,9 @@ def compute_stable_content_hash(
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
+
 def parse_public_listing_html(html: str) -> ParsedArticle:
+    """Parse HTML safely, extracting <div class='copy-buttons'> credentials and any listed apps."""
     if not html or not html.strip():
         return ParsedArticle(title="", apps=[], sanitized_body_lines=[], content_hash="")
 

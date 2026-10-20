@@ -17,10 +17,12 @@ logger = logging.getLogger("appvault.notifications")
 
 DiscordSenderFunc = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
 
+
 def _get_source_apps_and_norms(session: Session, source_id: int) -> tuple[List[str], Set[str]]:
+    """Return (display_titles, normalized_names) for all active apps on a source."""
     links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.source_id == source_id, SourceApp.is_active == True)
+        .where(SourceApp.source_id == source_id, SourceApp.is_active == True)  # noqa: E712
         .order_by(SourceApp.display_order.asc())
     ).all()
     titles: List[str] = []
@@ -32,11 +34,13 @@ def _get_source_apps_and_norms(session: Session, source_id: int) -> tuple[List[s
             norms.add(app_obj.normalized_name)
     return titles, norms
 
+
 def build_change_notification_embed_dict(
     event: ChangeEvent,
     source: Optional[Source],
     game_titles: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
+    """Construct a clean, concise, production-ready Discord embed payload with single backticks for mobile copy."""
     email_val = event.account_email or (source.account_email if source else None) or "Đang cập nhật"
     pass_val = event.account_password or (source.account_password if source else None) or "Đang cập nhật"
 
@@ -65,6 +69,7 @@ def build_change_notification_embed_dict(
         "footer": {"text": f"AppVault • ID #{event.source_id}"},
     }
 
+
 async def default_discord_rest_sender(
     channel_id: str,
     embed_dict: Dict[str, Any],
@@ -72,6 +77,7 @@ async def default_discord_rest_sender(
     settings: Optional[Settings] = None,
     transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> None:
+    """Send an embed to a Discord channel via Discord REST API v10 with safe allowed_mentions."""
     cfg = settings or get_settings()
     token = (cfg.discord_bot_token or "").strip()
     if not token:
@@ -99,12 +105,14 @@ async def default_discord_rest_sender(
         if resp.status_code >= 400:
             raise RuntimeError(f"Discord API error HTTP {resp.status_code}")
 
+
 def acquire_event_notification_lease(
     session: Session,
     event: ChangeEvent,
     owner_id: str,
     ttl_seconds: int = 60,
 ) -> bool:
+    """Claim a pending ChangeEvent for notification delivery so multiple workers do not collide."""
     now = datetime.now(timezone.utc)
     if event.notification_status in ("sent", "skipped"):
         return False
@@ -133,11 +141,13 @@ def acquire_event_notification_lease(
     session.flush()
     return True
 
+
 def _subscription_matches_event(
     sub: DiscordSubscription,
     event: ChangeEvent,
     source_app_norms: Set[str],
 ) -> bool:
+    """Return True if a subscription matches both the event type and optional game filter."""
     types_raw = (sub.subscribed_event_types or "all").lower()
     subscribed_set = {t.strip() for t in types_raw.split(",") if t.strip()}
     if "all" not in subscribed_set and event.event_type.lower() not in subscribed_set:
@@ -154,6 +164,7 @@ def _subscription_matches_event(
             return True
     return False
 
+
 async def dispatch_pending_notifications(
     session: Session,
     *,
@@ -161,6 +172,7 @@ async def dispatch_pending_notifications(
     sender: Optional[DiscordSenderFunc] = None,
     settings: Optional[Settings] = None,
 ) -> int:
+    """Dispatch pending ChangeEvents to enabled DiscordSubscriptions with retry backoff and deduplication."""
     cfg = settings or get_settings()
     send_fn = sender or (lambda ch_id, emb: default_discord_rest_sender(ch_id, emb, settings=cfg))
 
@@ -171,7 +183,7 @@ async def dispatch_pending_notifications(
     ).all()
 
     active_subscriptions = session.scalars(
-        select(DiscordSubscription).where(DiscordSubscription.enabled == True)
+        select(DiscordSubscription).where(DiscordSubscription.enabled == True)  # noqa: E712
     ).all()
 
     completed_count = 0

@@ -16,13 +16,19 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+
 def utcnow() -> datetime:
+    """Return timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
 
+
 class Base(DeclarativeBase):
-    pass
+    """Declarative base class for all AppVault models."""
+
 
 class App(Base):
+    """Deduplicated canonical application or game record."""
+
     __tablename__ = "apps"
     __table_args__ = (
         Index("ix_apps_normalized_name", "normalized_name", unique=True),
@@ -46,7 +52,10 @@ class App(Base):
         "AppAlias", back_populates="app", cascade="all, delete-orphan"
     )
 
+
 class Source(Base):
+    """Monitored public listing source page and its extracted account credentials."""
+
     __tablename__ = "sources"
     __table_args__ = (
         Index("ix_sources_source_key", "source_key", unique=True),
@@ -87,7 +96,10 @@ class Source(Base):
         "ChangeEvent", back_populates="source", cascade="all, delete-orphan"
     )
 
+
 class SourceApp(Base):
+    """Association between a Source and an App, preserving original title, order, and data origin."""
+
     __tablename__ = "source_apps"
     __table_args__ = (
         Index("ix_source_apps_source_id", "source_id"),
@@ -110,7 +122,10 @@ class SourceApp(Base):
     source: Mapped["Source"] = relationship("Source", back_populates="app_links")
     app: Mapped["App"] = relationship("App", back_populates="source_links")
 
+
 class ChangeEvent(Base):
+    """Recorded meaningful change detected on a monitored source."""
+
     __tablename__ = "change_events"
     __table_args__ = (
         UniqueConstraint("source_id", "current_hash", name="uq_change_events_source_current_hash"),
@@ -141,7 +156,10 @@ class ChangeEvent(Base):
 
     source: Mapped["Source"] = relationship("Source", back_populates="change_events")
 
+
 class DiscordSubscription(Base):
+    """Guild channel subscription for automated change notifications (all games or filtered by game)."""
+
     __tablename__ = "discord_subscriptions"
     __table_args__ = (
         UniqueConstraint("channel_id", name="uq_discord_subscriptions_channel_id"),
@@ -161,7 +179,10 @@ class DiscordSubscription(Base):
     game_filter: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
+
 class AppAlias(Base):
+    """Alternative title, spelling correction, or common abbreviation for an App."""
+
     __tablename__ = "app_aliases"
     __table_args__ = (
         UniqueConstraint("app_id", "normalized_alias", name="uq_app_aliases_app_norm"),
@@ -178,7 +199,10 @@ class AppAlias(Base):
 
     app: Mapped["App"] = relationship("App", back_populates="aliases")
 
+
 class NotificationDelivery(Base):
+    """Tracks per-channel delivery for each ChangeEvent to prevent duplicate Discord messages on retry."""
+
     __tablename__ = "notification_deliveries"
     __table_args__ = (
         UniqueConstraint("change_event_id", "channel_id", name="uq_notification_delivery_event_channel"),
@@ -192,7 +216,10 @@ class NotificationDelivery(Base):
     channel_id: Mapped[str] = mapped_column(String(64), nullable=False)
     delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
+
 class WorkerState(Base):
+    """Shared coordination row for worker pause state, heartbeat, and command sync metadata."""
+
     __tablename__ = "worker_state"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

@@ -19,7 +19,9 @@ from app.services.catalog import (
     normalize_app_name,
 )
 
+
 def _get_seed_normalized_names_for_source(source_id: int) -> Set[str]:
+    """Return the set of normalized app names belonging to a source's seed specification."""
     for spec in SEED_SOURCES:
         if int(spec["id"]) == int(source_id):
             return {
@@ -29,18 +31,22 @@ def _get_seed_normalized_names_for_source(source_id: int) -> Set[str]:
             }
     return set()
 
+
 def _determine_source_origin(links: List[SourceApp]) -> str:
+    """Return 'observed' if any active link is from observed page content, else 'seed'."""
     if not links:
         return "seed"
     if any(lk.data_origin == "observed" for lk in links):
         return "observed"
     return "seed"
 
+
 def apply_fetch_and_detect_changes(
     session: Session,
     source: Source,
     fetch_result: FetchResult,
 ) -> SourceCheckOutcomeSchema:
+    """Process a FetchResult for a Source, updating account credentials and preserving seed apps."""
     now = datetime.now(timezone.utc)
     source.last_checked_at = now
     source.updated_at = now
@@ -63,6 +69,7 @@ def apply_fetch_and_detect_changes(
     active_links = [lk for lk in all_links if lk.is_active]
     current_origin = _determine_source_origin(active_links)
 
+    # 1. Handle failed HTTP fetch: never erase or deactivate existing catalog data
     if not fetch_result.ok:
         safe_error = redact_sensitive_text(fetch_result.error or "HTTP check failed")
         source.last_http_status = fetch_result.status_code
@@ -84,6 +91,7 @@ def apply_fetch_and_detect_changes(
             checked_at=now,
         )
 
+    # 2. Handle HTTP 304 Not Modified: preserve seed/observed records and existing credentials
     if fetch_result.not_modified:
         source.last_success_at = now
         source.last_http_status = 304
@@ -109,7 +117,9 @@ def apply_fetch_and_detect_changes(
             checked_at=now,
         )
 
+    # 3. Parse HTML content
     parsed: ParsedArticle = parse_public_listing_html(fetch_result.content)
+
     has_credentials = bool(parsed.account_email or parsed.account_password)
     if not parsed.apps and not parsed.sanitized_body_lines and not has_credentials:
         err_msg = "Page fetched but no parseable public app listing or article content found; preserving catalog"
@@ -145,6 +155,7 @@ def apply_fetch_and_detect_changes(
         if parsed.account_password is not None:
             source.account_password = parsed.account_password
         source.account_updated_at = now
+        # Mark seed links on this live-verified source as observed
         for lk in active_links:
             lk.data_origin = "observed"
             lk.last_seen_at = now
@@ -213,7 +224,7 @@ def apply_fetch_and_detect_changes(
     session.flush()
     updated_active_links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)
+        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)  # noqa: E712
         .order_by(SourceApp.display_order.asc())
     ).all()
     effective_origin = _determine_source_origin(updated_active_links)

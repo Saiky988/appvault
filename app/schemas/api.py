@@ -53,6 +53,7 @@ class AppSummarySchema(BaseModel):
     canonical_name: str
     normalized_name: str
     platform: Optional[str] = "iOS"
+    icon_url: Optional[str] = None
     source_ids: List[int] = Field(default_factory=list)
     sources: List[SourceBriefSchema] = Field(default_factory=list)
     aliases: List[str] = Field(default_factory=list)
