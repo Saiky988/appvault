@@ -16,7 +16,6 @@ from app.core.security import (
 )
 from app.services.catalog import normalize_app_name
 
-# Tags removed after extracting copy-buttons input values
 NOISE_TAGS = (
     "script",
     "style",
@@ -73,6 +72,10 @@ IGNORED_CANDIDATE_PHRASES = (
     "khong dang nhap",
     "chỉ đăng nhập",
     "chi dang nhap",
+    "không chia sẻ",
+    "khong chia se",
+    "bất cứ ai",
+    "bat cu ai",
     "đăng nhập",
     "dang nhap",
     "đăng xuất",
@@ -168,7 +171,6 @@ def _extract_copy_buttons_credentials(soup: BeautifulSoup) -> Tuple[Optional[str
     email_val: Optional[str] = None
     password_val: Optional[str] = None
 
-    # 1. Inspect <input> tags by id or name attribute
     for inp in soup.find_all("input"):
         if inp.attrs is None:
             continue
@@ -182,7 +184,6 @@ def _extract_copy_buttons_credentials(soup: BeautifulSoup) -> Tuple[Optional[str
         elif password_val is None and any(k in ident_clean for k in PASSWORD_INPUT_IDS):
             password_val = raw_val
 
-    # 2. Fallback: look inside .copy-buttons container for two consecutive <input value="..."> tags
     if email_val is None or password_val is None:
         copy_box = soup.select_one(".copy-buttons")
         if copy_box is not None:
@@ -289,7 +290,6 @@ def parse_public_listing_html(html: str) -> ParsedArticle:
     for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
         comment.extract()
 
-    # Extract <input id="email"> and <input id="password"> BEFORE decomposing input/button tags
     account_email, account_password = _extract_copy_buttons_credentials(soup)
 
     for tag_name in NOISE_TAGS:

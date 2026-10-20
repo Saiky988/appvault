@@ -115,18 +115,15 @@ def test_unified_source_relationships_and_autocomplete(db_session: Session) -> N
     reload_seed_catalog(db_session)
     db_session.commit()
 
-    # 1. Initial autocomplete before typing shows up to 25 games immediately
     initial_choices = get_game_autocomplete_choices("")
     assert len(initial_choices) == 25
     assert any("Minecraft" in c.name for c in initial_choices)
 
-    # 2. Typing filters autocomplete dynamically
     typed_choices = get_game_autocomplete_choices("Mine")
     assert len(typed_choices) >= 1
     assert "Minecraft" in typed_choices[0].name
     assert "#1, #19, #20" in typed_choices[0].name
 
-    # 3. Source ID autocomplete for Minecraft suggests Random, ID 1, ID 19, ID 20
     id_choices = get_source_id_autocomplete_choices("Minecraft", "")
     id_vals = [c.value for c in id_choices]
     assert id_vals == ["Random", "1", "19", "20"]
@@ -147,9 +144,8 @@ def test_unified_source_relationships_and_autocomplete(db_session: Session) -> N
 
 @pytest.mark.asyncio
 async def test_discord_slash_commands_app_credentials_and_game_subscribe(db_session: Session) -> None:
-    """Verify /app (Random and specific ID), /subscribe (with game), /source-apps, and /search."""
+    """Verify concise /app embed with single-backtick mobile copy, /source-apps pagination, and /subscribe."""
     reload_seed_catalog(db_session)
-    # Populate credentials on Source 20
     src20 = db_session.get(Source, 20)
     assert src20 is not None
     src20.account_email = "mc_id20@example.com"
@@ -172,7 +168,7 @@ async def test_discord_slash_commands_app_credentials_and_game_subscribe(db_sess
         "admin",
     }.issubset(cmd_names)
 
-    # 1. Execute /app name:Minecraft (Random mode automatically picks Source 20 which has credentials)
+    # 1. Execute /app name:Minecraft (Random mode picks Source 20 which has credentials)
     ix_app_rand = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
     app_cmd = bot.tree.get_command("app")
     assert app_cmd is not None
@@ -180,15 +176,17 @@ async def test_discord_slash_commands_app_credentials_and_game_subscribe(db_sess
     app_embed = ix_app_rand.response.messages[0]["embed"]
     assert app_embed is not None
     assert "ID #20" in (app_embed.title or "")
-    assert "mc_id20@example.com" in app_embed.fields[0]["value"]
-    assert "SecretPass20!" in app_embed.fields[1]["value"]
+    assert app_embed.url is None
+    assert app_embed.fields[0]["value"] == "`mc_id20@example.com`"
+    assert app_embed.fields[1]["value"] == "`SecretPass20!`"
+    assert "#1, #19, #20" in app_embed.fields[3]["value"]
 
     # 2. Execute /app name:Minecraft id:20 (Specific ID mode)
     ix_app_20 = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
     await app_cmd.callback(ix_app_20, "Minecraft", "20")
     app_embed_20 = ix_app_20.response.messages[0]["embed"]
     assert "ID #20" in (app_embed_20.title or "")
-    assert "mc_id20@example.com" in app_embed_20.fields[0]["value"]
+    assert app_embed_20.fields[0]["value"] == "`mc_id20@example.com`"
 
     # 3. Execute /source-apps for Source 5 (21 apps -> 3 pages at 10 per page)
     ix_sa = discord.Interaction(user_id=1001, guild_id=2001, channel_id=3001)
@@ -197,13 +195,13 @@ async def test_discord_slash_commands_app_credentials_and_game_subscribe(db_sess
     sa_msg = ix_sa.response.messages[0]
     sa_embed_p1 = sa_msg["embed"]
     sa_view = sa_msg["view"]
-    assert "Source #5 Applications (21 Total)" in (sa_embed_p1.title or "")
-    assert "Page 1/3" in (sa_embed_p1.footer["text"] or "")
+    assert "ID #5 (21 Game)" in (sa_embed_p1.title or "")
+    assert "Trang 1/3" in (sa_embed_p1.footer["text"] or "")
 
     next_btn = [c for c in sa_view.children if getattr(c, "custom_id", None) == "next_page"][0]
     await next_btn.callback(ix_sa, next_btn)
     sa_embed_p2 = ix_sa.response.messages[-1]["embed"]
-    assert "Page 2/3" in (sa_embed_p2.footer["text"] or "")
+    assert "Trang 2/3" in (sa_embed_p2.footer["text"] or "")
 
     # 4. Execute /subscribe with optional game="Minecraft"
     ix_sub = discord.Interaction(

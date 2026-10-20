@@ -40,39 +40,33 @@ def build_change_notification_embed_dict(
     source: Optional[Source],
     game_titles: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Construct an icon-free Discord embed payload for a ChangeEvent including account credentials."""
-    source_url = source.url if source else None
-    source_label = f"ID #{event.source_id}" + (f" (Key {source.source_key})" if source else "")
-    email_val = event.account_email or (source.account_email if source else None) or "N/A"
-    pass_val = event.account_password or (source.account_password if source else None) or "N/A"
+    """Construct a clean, concise, production-ready Discord embed payload with single backticks for mobile copy."""
+    email_val = event.account_email or (source.account_email if source else None) or "Đang cập nhật"
+    pass_val = event.account_password or (source.account_password if source else None) or "Đang cập nhật"
 
     fields: List[Dict[str, Any]] = [
-        {"name": "ID", "value": f"`#{event.source_id}`", "inline": True},
-        {"name": "Event", "value": f"`{event.event_type}`", "inline": True},
-        {"name": "Tai Khoan (Email)", "value": f"```\n{email_val}\n```", "inline": False},
-        {"name": "Mat Khau (Password)", "value": f"```\n{pass_val}\n```", "inline": False},
+        {"name": "Tài khoản", "value": f"`{email_val}`", "inline": False},
+        {"name": "Mật khẩu", "value": f"`{pass_val}`", "inline": False},
     ]
 
     if game_titles:
-        preview = ", ".join(game_titles[:12])
-        if len(game_titles) > 12:
-            preview += f" (+{len(game_titles) - 12} more)"
+        preview = ", ".join(game_titles[:15])
+        if len(game_titles) > 15:
+            preview += f" (+{len(game_titles) - 15} game)"
         fields.append(
             {
-                "name": f"Games in ID #{event.source_id} ({len(game_titles)})",
+                "name": f"Danh sách Game ({len(game_titles)})",
                 "value": preview[:1024],
                 "inline": False,
             }
         )
 
     return {
-        "title": f"Account Update — {source_label}",
-        "description": (event.summary or "Updated account credentials.")[:2000],
-        "url": source_url,
-        "color": 0x2ECC71 if event.event_type in ("credentials_updated", "apps_updated", "initial_observation") else 0x3498DB,
+        "title": f"Cập nhật Tài khoản — ID #{event.source_id}",
+        "color": 0x2ECC71,
         "timestamp": event.detected_at.astimezone(timezone.utc).isoformat(),
         "fields": fields,
-        "footer": {"text": f"AppVault Monitor | ID #{event.source_id}"},
+        "footer": {"text": f"AppVault • ID #{event.source_id}"},
     }
 
 

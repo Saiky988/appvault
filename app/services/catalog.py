@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -20,7 +20,7 @@ from app.schemas.api import (
     SourceBriefSchema,
 )
 
-SEED_CATALOG_VERSION = "2026.10.3"
+SEED_CATALOG_VERSION = "2026.10.4"
 
 SPELLING_CORRECTIONS: Dict[str, str] = {
     "subway subfers": "subway surfers",
@@ -271,7 +271,7 @@ def reload_seed_catalog(
     session: Session,
     seed_sources: Sequence[Dict[str, Any]] = SEED_SOURCES,
 ) -> CatalogReloadResponseSchema:
-    """Idempotently load or reload the versioned seed catalog without erasing history or subscriptions."""
+    """Idempotently load or reload the versioned seed catalog and clean up any stray instructional rows."""
     from app.monitoring.parser import is_ignored_candidate_title
 
     sources_created = 0
@@ -282,6 +282,7 @@ def reload_seed_catalog(
     links_updated = 0
     aliases_created = 0
     now = datetime.now(timezone.utc)
+    all_seed_app_ids: Set[int] = set()
 
     for src_spec in seed_sources:
         src_id = int(src_spec["id"])
@@ -320,9 +321,8 @@ def reload_seed_catalog(
             else:
                 apps_existing += 1
 
-            if app_obj.id in seen_app_ids_in_source:
-                continue
             seen_app_ids_in_source.add(app_obj.id)
+            all_seed_app_ids.add(app_obj.id)
 
             link = session.get(SourceApp, (source.id, app_obj.id))
             if link is None:
@@ -356,6 +356,24 @@ def reload_seed_catalog(
                 session.delete(link)
 
         session.flush()
+
+    # Also purge any stray App rows that match instructional boilerplate
+    all_apps = session.scalars(select(App)).all()
+    for a in all_apps:
+        if a.id not in all_seed_app_ids and (
+            is_ignored_candidate_title(a.canonical_name)
+            or contains_sensitive_credentials(a.canonical_name)
+        ):
+            session.delete(a)
+
+    # Purge any legacy ChangeEvent rows whose summary contained instructional text from older parser runs
+    all_events = session.scalars(select(ChangeEvent)).all()
+    for ev in all_events:
+        low_sum = (ev.summary or "").lower()
+        if "không đăng nhập" in low_sum or "không chia sẻ" in low_sum:
+            session.delete(ev)
+
+    session.flush()
 
     return CatalogReloadResponseSchema(
         version=SEED_CATALOG_VERSION,
