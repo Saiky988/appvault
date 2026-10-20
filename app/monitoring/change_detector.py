@@ -1,0 +1,262 @@
+"""Change detection and source catalog update pipeline."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+from typing import List, Optional
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.security import redact_sensitive_text
+from app.db.models import App, ChangeEvent, Source, SourceApp
+from app.monitoring.fetcher import FetchResult
+from app.monitoring.parser import ParsedArticle, parse_public_listing_html
+from app.schemas.api import SourceCheckOutcomeSchema
+from app.services.catalog import ensure_app_and_aliases
+
+
+def apply_fetch_and_detect_changes(
+    session: Session,
+    source: Source,
+    fetch_result: FetchResult,
+) -> SourceCheckOutcomeSchema:
+    """Process a FetchResult for a Source, preserving seed data on errors and recording meaningful changes."""
+    now = datetime.now(timezone.utc)
+    source.last_checked_at = now
+    source.updated_at = now
+
+    active_links = session.scalars(
+        select(SourceApp)
+        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)  # noqa: E712
+        .order_by(SourceApp.display_order.asc())
+    ).all()
+    current_origin = (
+        "observed"
+        if (active_links and all(lk.data_origin == "observed" for lk in active_links))
+        else "seed"
+    )
+
+    # 1. Handle failed HTTP fetch: never erase existing catalog data
+    if not fetch_result.ok:
+        safe_error = redact_sensitive_text(fetch_result.error or "HTTP check failed")
+        source.last_http_status = fetch_result.status_code
+        source.last_error = safe_error
+        session.flush()
+        return SourceCheckOutcomeSchema(
+            source_id=source.id,
+            source_key=source.source_key,
+            url=source.url,
+            status="error",
+            http_status=fetch_result.status_code,
+            changed=False,
+            change_event_id=None,
+            extracted_app_count=len(active_links),
+            data_origin=current_origin,
+            error=safe_error,
+            checked_at=now,
+        )
+
+    # 2. Handle HTTP 304 Not Modified
+    if fetch_result.not_modified:
+        source.last_success_at = now
+        source.last_http_status = 304
+        source.last_error = None
+        if fetch_result.etag:
+            source.etag = fetch_result.etag
+        if fetch_result.last_modified:
+            source.last_modified = fetch_result.last_modified
+        session.flush()
+        return SourceCheckOutcomeSchema(
+            source_id=source.id,
+            source_key=source.source_key,
+            url=source.url,
+            status="not_modified",
+            http_status=304,
+            changed=False,
+            change_event_id=None,
+            extracted_app_count=len(active_links),
+            data_origin=current_origin,
+            error=None,
+            checked_at=now,
+        )
+
+    # 3. Parse HTML content
+    parsed: ParsedArticle = parse_public_listing_html(fetch_result.content)
+
+    # If extraction found 0 apps and no meaningful body, treat as unparseable and preserve seed data
+    if not parsed.apps and not parsed.sanitized_body_lines:
+        err_msg = "Page fetched but no parseable public app listing or article content found; preserving catalog"
+        source.last_http_status = fetch_result.status_code or 200
+        source.last_error = err_msg
+        session.flush()
+        return SourceCheckOutcomeSchema(
+            source_id=source.id,
+            source_key=source.source_key,
+            url=source.url,
+            status="parse_error",
+            http_status=source.last_http_status,
+            changed=False,
+            change_event_id=None,
+            extracted_app_count=len(active_links),
+            data_origin=current_origin,
+            error=err_msg,
+            checked_at=now,
+        )
+
+    # If the page returned body text but 0 app bullets, preserve existing seed apps while recording body state
+    previous_hash = source.current_content_hash
+    old_app_names: List[str] = []
+    for lk in active_links:
+        app_obj = session.get(App, lk.app_id)
+        if app_obj:
+            old_app_names.append(app_obj.canonical_name)
+
+    added_titles: List[str] = []
+    removed_titles: List[str] = []
+    effective_origin = current_origin
+
+    if parsed.apps:
+        effective_origin = "observed"
+        new_app_ids_ordered: List[int] = []
+        new_canonical_names: List[str] = []
+        for idx, raw_title in enumerate(parsed.apps):
+            try:
+                app_obj, _created, _alias_cnt = ensure_app_and_aliases(session, raw_title)
+            except ValueError:
+                continue
+            if app_obj.id in new_app_ids_ordered:
+                continue
+            new_app_ids_ordered.append(app_obj.id)
+            new_canonical_names.append(app_obj.canonical_name)
+
+            existing_link = session.get(SourceApp, (source.id, app_obj.id))
+            if existing_link is None:
+                session.add(
+                    SourceApp(
+                        source_id=source.id,
+                        app_id=app_obj.id,
+                        original_title=raw_title,
+                        display_order=idx,
+                        data_origin="observed",
+                        is_active=True,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                )
+            else:
+                existing_link.original_title = raw_title
+                existing_link.display_order = idx
+                existing_link.data_origin = "observed"
+                existing_link.is_active = True
+                existing_link.last_seen_at = now
+
+        old_set = set(old_app_names)
+        new_set = set(new_canonical_names)
+        added_titles = [n for n in new_canonical_names if n not in old_set]
+        removed_titles = [n for n in old_app_names if n not in new_set]
+
+        # Deactivate apps no longer listed on a successfully parsed page (only when >=1 valid app extracted)
+        if new_app_ids_ordered:
+            for lk in active_links:
+                if lk.app_id not in new_app_ids_ordered:
+                    lk.is_active = False
+
+    source.last_success_at = now
+    source.last_http_status = fetch_result.status_code or 200
+    source.last_error = None
+    if fetch_result.etag:
+        source.etag = fetch_result.etag
+    if fetch_result.last_modified:
+        source.last_modified = fetch_result.last_modified
+
+    new_hash = parsed.content_hash
+    if previous_hash == new_hash:
+        session.flush()
+        return SourceCheckOutcomeSchema(
+            source_id=source.id,
+            source_key=source.source_key,
+            url=source.url,
+            status="unchanged",
+            http_status=source.last_http_status,
+            changed=False,
+            change_event_id=None,
+            extracted_app_count=len(parsed.apps) if parsed.apps else len(active_links),
+            data_origin=effective_origin,
+            error=None,
+            checked_at=now,
+        )
+
+    # Determine meaningful event_type and summary
+    if previous_hash is None:
+        event_type = "initial_observation"
+        summary_parts = [
+            f"Source #{source.id} verified live ({len(parsed.apps)} apps observed)."
+        ]
+        if added_titles:
+            summary_parts.append(f"Added: {', '.join(added_titles[:5])}")
+        if removed_titles:
+            summary_parts.append(f"Removed: {', '.join(removed_titles[:5])}")
+        summary = " ".join(summary_parts)
+    elif added_titles or removed_titles:
+        event_type = "apps_updated"
+        parts: List[str] = [f"Source #{source.id} catalog updated."]
+        if added_titles:
+            parts.append(f"Added ({len(added_titles)}): {', '.join(added_titles[:6])}.")
+        if removed_titles:
+            parts.append(f"Removed ({len(removed_titles)}): {', '.join(removed_titles[:6])}.")
+        summary = " ".join(parts)
+    else:
+        event_type = "content_updated"
+        safe_title = redact_sensitive_text(parsed.title or f"Source #{source.id}")
+        summary = f"Source #{source.id} article content updated ('{safe_title[:80]}')."
+
+    summary = redact_sensitive_text(summary)
+    source.current_content_hash = new_hash
+
+    # Deduplicate ChangeEvent by (source_id, current_hash)
+    existing_event = session.scalar(
+        select(ChangeEvent).where(
+            ChangeEvent.source_id == source.id,
+            ChangeEvent.current_hash == new_hash,
+        )
+    )
+
+    change_event_id: Optional[int] = None
+    if existing_event is None:
+        details = {
+            "title": redact_sensitive_text(parsed.title),
+            "added_apps": added_titles,
+            "removed_apps": removed_titles,
+            "observed_app_count": len(parsed.apps),
+        }
+        new_event = ChangeEvent(
+            source_id=source.id,
+            event_type=event_type,
+            previous_hash=previous_hash,
+            current_hash=new_hash,
+            summary=summary,
+            details_json=json.dumps(details, ensure_ascii=False),
+            detected_at=now,
+            notification_status="pending",
+            notification_attempts=0,
+        )
+        session.add(new_event)
+        session.flush()
+        change_event_id = new_event.id
+    else:
+        change_event_id = existing_event.id
+
+    return SourceCheckOutcomeSchema(
+        source_id=source.id,
+        source_key=source.source_key,
+        url=source.url,
+        status="changed",
+        http_status=source.last_http_status,
+        changed=True,
+        change_event_id=change_event_id,
+        extracted_app_count=len(parsed.apps) if parsed.apps else len(active_links),
+        data_origin=effective_origin,
+        error=None,
+        checked_at=now,
+    )
