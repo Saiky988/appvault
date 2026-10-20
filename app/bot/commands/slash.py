@@ -14,6 +14,7 @@ from app.bot.embeds import (
     build_catalog_embed,
     build_check_outcome_embed,
     build_search_embed,
+    build_source_apps_embed,
     build_source_detail_embed,
     build_status_embed,
     build_updates_embed,
@@ -115,13 +116,60 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    @tree.command(name="source-apps", description="List all applications associated with a specific source ID")
+    @app_commands.describe(source_id="Source ID (e.g. 1, 5, 15, 19, 20)")
+    async def cmd_source_apps(interaction: discord.Interaction, source_id: int) -> None:
+        per_page = 10
+        with session_scope() as session:
+            src_obj = get_source_by_id_or_key(session, source_id)
+            if src_obj is None:
+                await interaction.response.send_message(
+                    f"Source `#{source_id}` was not found.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            src_schema = build_source_schema(session, src_obj)
+            src_apps_resp = list_source_apps_paginated(session, src_obj.id, limit=500, offset=0)
+            src_apps = src_apps_resp.items if src_apps_resp else []
+
+        total_pages = max(1, math.ceil(len(src_apps) / per_page))
+        embed = build_source_apps_embed(
+            source=src_schema,
+            source_apps=src_apps,
+            page=1,
+            per_page=per_page,
+        )
+
+        if total_pages > 1:
+            view = PaginationView(
+                total_pages=total_pages,
+                page_builder=lambda p: build_source_apps_embed(
+                    source=src_schema,
+                    source_apps=src_apps,
+                    page=p,
+                    per_page=per_page,
+                ),
+                author_id=interaction.user.id,
+            )
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
     @tree.command(name="catalog", description="Browse all apps in a specific source or across the entire catalog")
     @app_commands.describe(source_id="Optional Source ID (e.g. 1, 5, 15, 19, 20)")
     async def cmd_catalog(
         interaction: discord.Interaction,
         source_id: Optional[int] = None,
     ) -> None:
-        per_page = 8
+        per_page = 10
         with session_scope() as session:
             if source_id is not None:
                 src_obj = get_source_by_id_or_key(session, source_id)
@@ -133,7 +181,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
                     )
                     return
                 src_schema = build_source_schema(session, src_obj)
-                src_apps_resp = list_source_apps_paginated(session, src_obj.id, limit=200, offset=0)
+                src_apps_resp = list_source_apps_paginated(session, src_obj.id, limit=500, offset=0)
                 src_apps = src_apps_resp.items if src_apps_resp else []
                 total_pages = max(1, math.ceil(len(src_apps) / per_page))
                 embed = build_catalog_embed(
@@ -151,7 +199,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
                     per_page=per_page,
                 )
             else:
-                all_apps_resp = list_apps_paginated(session, limit=200, offset=0)
+                all_apps_resp = list_apps_paginated(session, limit=500, offset=0)
                 all_apps = all_apps_resp.items
                 total_pages = max(1, math.ceil(len(all_apps) / per_page))
                 embed = build_catalog_embed(
@@ -253,7 +301,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
 
         action_word = "Subscribed" if created else "Updated subscription for"
         await interaction.response.send_message(
-            f"✅ {action_word} <#{sub.channel_id}> to AppVault change notifications.",
+            f"{action_word} <#{sub.channel_id}> to AppVault change notifications.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -273,7 +321,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
 
         if disabled:
             await interaction.response.send_message(
-                f"🔕 Disabled AppVault notifications for <#{channel_id}>.",
+                f"Disabled AppVault notifications for <#{channel_id}>.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         else:
@@ -308,7 +356,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
     async def cmd_check(interaction: discord.Interaction, source_id: int) -> None:
         if not is_authorized_admin(interaction):
             await interaction.response.send_message(
-                "🚫 You are not authorized to run manual source checks.",
+                "You are not authorized to run manual source checks.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -333,7 +381,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             )
         except SourceCheckAlreadyRunningError as exc:
             await interaction.followup.send(
-                f"⏳ {redact_sensitive_text(str(exc))}",
+                redact_sensitive_text(str(exc)),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -354,7 +402,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
     async def cmd_admin_pause(interaction: discord.Interaction) -> None:
         if not is_authorized_admin(interaction):
             await interaction.response.send_message(
-                "🚫 Administrator authorization required.",
+                "Administrator authorization required.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -362,7 +410,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
         with session_scope() as session:
             state = set_worker_paused(session, True)
         await interaction.response.send_message(
-            f"⏸️ Background monitoring worker paused (updated at `{state.updated_at.strftime('%H:%M:%S UTC')}`).",
+            f"Background monitoring worker paused (updated at `{state.updated_at.strftime('%H:%M:%S UTC')}`).",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -370,7 +418,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
     async def cmd_admin_resume(interaction: discord.Interaction) -> None:
         if not is_authorized_admin(interaction):
             await interaction.response.send_message(
-                "🚫 Administrator authorization required.",
+                "Administrator authorization required.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -378,7 +426,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
         with session_scope() as session:
             state = set_worker_paused(session, False)
         await interaction.response.send_message(
-            f"▶️ Background monitoring worker resumed (updated at `{state.updated_at.strftime('%H:%M:%S UTC')}`).",
+            f"Background monitoring worker resumed (updated at `{state.updated_at.strftime('%H:%M:%S UTC')}`).",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -386,7 +434,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
     async def cmd_admin_check_all(interaction: discord.Interaction) -> None:
         if not is_authorized_admin(interaction):
             await interaction.response.send_message(
-                "🚫 Administrator authorization required.",
+                "Administrator authorization required.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -397,13 +445,13 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
             only_due=False,
         )
         lines = [
-            f"• **Source #{o.source_id}**: `{o.status}` (HTTP `{o.http_status or 'N/A'}` | Apps: `{o.extracted_app_count}`)"
-            + (f" — ⚠️ `{redact_sensitive_text(o.error)[:60]}`" if o.error else "")
+            f"- **Source #{o.source_id}**: `{o.status}` (HTTP `{o.http_status or 'N/A'}` | Apps: `{o.extracted_app_count}`)"
+            + (f" — Error: `{redact_sensitive_text(o.error)[:60]}`" if o.error else "")
             for o in outcomes
         ]
         summary_text = "\n".join(lines) if lines else "No enabled sources were checked."
         await interaction.followup.send(
-            f"✅ Completed check across **{len(outcomes)}** source(s):\n{summary_text}"[:2000],
+            f"Completed check across **{len(outcomes)}** source(s):\n{summary_text}"[:2000],
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -411,7 +459,7 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
     async def cmd_admin_reload_catalog(interaction: discord.Interaction) -> None:
         if not is_authorized_admin(interaction):
             await interaction.response.send_message(
-                "🚫 Administrator authorization required.",
+                "Administrator authorization required.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -419,11 +467,11 @@ def register_slash_commands(tree: app_commands.CommandTree, client: discord.Clie
         with session_scope() as session:
             res = reload_seed_catalog(session)
         await interaction.response.send_message(
-            f"🔄 Reloaded seed catalog `v{res.version}`:\n"
-            f"• Sources: `{res.sources_created}` created, `{res.sources_updated}` updated\n"
-            f"• Apps: `{res.apps_created}` created, `{res.apps_existing}` existing\n"
-            f"• Source Links: `{res.links_created}` created, `{res.links_updated}` updated\n"
-            f"• Aliases added: `{res.aliases_created}`",
+            f"Reloaded seed catalog `v{res.version}`:\n"
+            f"- Sources: `{res.sources_created}` created, `{res.sources_updated}` updated\n"
+            f"- Apps: `{res.apps_created}` created, `{res.apps_existing}` existing\n"
+            f"- Source Links: `{res.links_created}` created, `{res.links_updated}` updated\n"
+            f"- Aliases added: `{res.aliases_created}`",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

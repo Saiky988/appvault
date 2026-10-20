@@ -17,7 +17,7 @@ from app.schemas.api import (
     WorkerStateResponseSchema,
 )
 from app.services.catalog import reload_seed_catalog
-from app.services.sources import get_source_by_id_or_key, set_worker_paused
+from app.services.sources import set_worker_paused
 
 router = APIRouter(
     prefix="/api/v1/admin",
@@ -31,18 +31,14 @@ router = APIRouter(
     response_model=SourceCheckOutcomeSchema,
     summary="Trigger an immediate manual check for a specific source",
 )
-async def admin_check_source(
-    source_id: int,
-    session: Session = Depends(get_db_session),
-) -> SourceCheckOutcomeSchema:
-    source = get_source_by_id_or_key(session, source_id)
-    if source is None:
+async def admin_check_source(source_id: int) -> SourceCheckOutcomeSchema:
+    try:
+        return await check_single_source(source_id, worker_id="api-admin")
+    except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Source with id={source_id} not found.",
-        )
-    try:
-        return await check_single_source(source.id, worker_id="api-admin")
+        ) from exc
     except SourceCheckAlreadyRunningError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -110,15 +110,29 @@ def release_source_lease(session: Session, source_id: int, owner_id: Optional[st
         session.flush()
 
 
+def get_active_source_links(session: Session, source_id: int) -> List[SourceApp]:
+    """Return active SourceApp links ordered by display_order, with fallback if seed links were deactivated."""
+    links = session.scalars(
+        select(SourceApp)
+        .where(
+            SourceApp.source_id == source_id,
+            SourceApp.is_active == True,  # noqa: E712
+        )
+        .order_by(SourceApp.display_order.asc(), SourceApp.app_id.asc())
+    ).all()
+    if not links:
+        links = session.scalars(
+            select(SourceApp)
+            .where(SourceApp.source_id == source_id)
+            .order_by(SourceApp.display_order.asc(), SourceApp.app_id.asc())
+        ).all()
+    return list(links)
+
+
 def build_source_schema(session: Session, source: Source) -> SourceSchema:
     """Convert a Source ORM instance into a SourceSchema with app counts."""
     settings = get_settings()
-    links = session.scalars(
-        select(SourceApp).where(
-            SourceApp.source_id == source.id,
-            SourceApp.is_active == True,  # noqa: E712
-        )
-    ).all()
+    links = get_active_source_links(session, source.id)
     seed_count = sum(1 for link in links if link.data_origin == "seed")
     observed_count = sum(1 for link in links if link.data_origin == "observed")
     effective_interval = source.check_interval_seconds or settings.monitor_interval_seconds
@@ -185,11 +199,7 @@ def list_source_apps_paginated(
     if source is None:
         return None
 
-    all_links = session.scalars(
-        select(SourceApp)
-        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)  # noqa: E712
-        .order_by(SourceApp.display_order.asc(), SourceApp.app_id.asc())
-    ).all()
+    all_links = get_active_source_links(session, source.id)
     total = len(all_links)
     sliced = all_links[offset : offset + limit]
 

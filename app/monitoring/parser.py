@@ -54,31 +54,92 @@ NOISE_ATTR_TOKENS = (
     "post-timestamp",
     "blog-pager",
     "popular-posts",
-    "Attribution",
+    "attribution",
+    "widget",
+    "header",
+    "menu",
+    "breadcrumb",
 )
 
 # Generic non-app headings/phrases commonly found on Vietnamese/English blogspot instructional posts
 IGNORED_CANDIDATE_PHRASES = (
-    "hướng dẫn sử dụng",
-    "huong dan su dung",
-    "lưu ý quan trọng",
-    "không đăng nhập icloud",
-    "khong dang nhap icloud",
-    "chỉ đăng nhập app store",
-    "chi dang nhap app store",
+    "hướng dẫn",
+    "huong dan",
+    "sử dụng",
+    "su dung",
+    "lưu ý",
+    "luu y",
+    "quan trọng",
+    "quan trong",
+    "không đăng nhập",
+    "khong dang nhap",
+    "chỉ đăng nhập",
+    "chi dang nhap",
+    "đăng nhập",
+    "dang nhap",
+    "đăng xuất",
+    "dang xuat",
+    "tài khoản",
+    "tai khoan",
+    "mật khẩu",
+    "mat khau",
+    "id apple",
+    "apple id",
+    "app store",
+    "icloud",
+    "cài đặt",
+    "cai dat",
+    "bước 1",
+    "bước 2",
+    "bước 3",
+    "bước 4",
+    "bước 5",
+    "buoc 1",
+    "buoc 2",
+    "buoc 3",
+    "buoc 4",
+    "buoc 5",
     "danh sách game",
     "danh sach game",
+    "danh sách ứng dụng",
+    "danh sach ung dung",
+    "tải game",
+    "tai game",
+    "tải xuống",
+    "tai xuong",
+    "đã mua",
+    "da mua",
+    " không cập nhật",
+    "khong cap nhat",
+    "sao chép",
+    "sao chep",
+    "bài đăng",
+    "bai dang",
+    "bình luận",
+    "binh luan",
+    "chia sẻ",
+    "chia se",
+    "xem thêm",
+    "xem them",
+    "trang chủ",
+    "trang chu",
+    "liên hệ",
+    "lien he",
+    "thông báo",
+    "thong bao",
     "app list",
     "game list",
     "click here",
-    "xem thêm",
-    "trang chủ",
+    "read more",
+    "older post",
+    "newer post",
     "home",
     "subscribe",
     "telegram",
     "discord",
     "facebook",
     "youtube",
+    "powered by blogger",
 )
 
 BULLET_LINE_RE = re.compile(r"^\s*(?:[\-\*\•\+\➢\➤\✓\✔]|\d+[\.\)])\s+(.+?)\s*$")
@@ -98,6 +159,19 @@ class ParsedArticle:
     had_redacted_lines: bool = False
 
 
+def is_ignored_candidate_title(text: str) -> bool:
+    """Return True if text matches known instructional phrases or non-app UI boilerplate."""
+    if not text:
+        return True
+    lower = " ".join(text.split()).strip().lower()
+    if any(phrase.strip() in lower for phrase in IGNORED_CANDIDATE_PHRASES):
+        return True
+    # Reject instructional sentences that end with colons or semicolons
+    if lower.endswith((":", ";", "?", "...")):
+        return True
+    return False
+
+
 def _clean_candidate_app_title(raw: str) -> Optional[str]:
     """Validate and clean a potential app/game title, returning None if noise or sensitive."""
     if not raw:
@@ -115,7 +189,7 @@ def _clean_candidate_app_title(raw: str) -> Optional[str]:
         return None
     if contains_sensitive_credentials(text):
         return None
-    if any(phrase in lower for phrase in IGNORED_CANDIDATE_PHRASES):
+    if is_ignored_candidate_title(text):
         return None
     if len(text.split()) > 9:
         return None

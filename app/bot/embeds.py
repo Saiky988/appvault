@@ -1,4 +1,4 @@
-"""Mobile-friendly Discord Embed builders and interactive pagination views."""
+"""Mobile-friendly, icon-free Discord Embed builders and interactive pagination views."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -28,18 +28,22 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _health_badge(health: str) -> str:
+def _health_label(health: str) -> str:
     mapping = {
-        "healthy": "🟢 Healthy",
-        "seed_only": "🟡 Seed Data (Unverified)",
-        "error": "🔴 Error",
-        "disabled": "⚪ Disabled",
+        "healthy": "Healthy",
+        "seed_only": "Seed (Unverified)",
+        "error": "Error",
+        "disabled": "Disabled",
     }
-    return mapping.get(health, f"⚪ {health}")
+    return mapping.get(health, str(health).capitalize())
 
 
-def _origin_badge(origin: str) -> str:
-    return "🌐 Observed Page Data" if origin == "observed" else "📦 Seed Data"
+def _origin_label(origin: str) -> str:
+    return "Observed Page Content" if origin == "observed" else "Seed Data"
+
+
+def _active_label(enabled: bool) -> str:
+    return "Active" if enabled else "Inactive"
 
 
 def build_search_embed(
@@ -48,18 +52,20 @@ def build_search_embed(
     page: int = 1,
     per_page: int = 5,
 ) -> discord.Embed:
-    """Build a paginated mobile-friendly embed for /search results."""
+    """Build a paginated, icon-free embed for /search results showing all matching source IDs."""
     total_items = len(search_resp.items)
     total_pages = max(1, math.ceil(total_items / per_page))
     safe_page = max(1, min(page, total_pages))
     start = (safe_page - 1) * per_page
     page_slice = search_resp.items[start : start + per_page]
 
+    safe_query = redact_sensitive_text(search_resp.query)[:80]
     embed = discord.Embed(
-        title=f"🔎 Search Results for '{redact_sensitive_text(search_resp.query)[:80]}'",
+        title=f"Search Results: {safe_query}",
         description=(
-            f"Found **{search_resp.total}** matching app(s) "
-            f"(normalized: `{search_resp.normalized_query}`). Showing page **{safe_page}/{total_pages}**."
+            f"Found **{search_resp.total}** matching application(s) "
+            f"(normalized query: `{search_resp.normalized_query}`). "
+            f"Showing page **{safe_page}/{total_pages}**."
             if total_items
             else "No matching applications found in the catalog."
         ),
@@ -69,38 +75,55 @@ def build_search_embed(
 
     for item in page_slice:
         app = item.app
-        src_lines: List[str] = []
-        for s in app.sources[:4]:
-            src_lines.append(
-                f"• **Source #{s.source_id}** ({_health_badge(s.health_status)}) — "
-                f"{_origin_badge(s.data_origin)}\n"
-                f"  Checked: `{_fmt_dt(s.last_checked_at)}` | [Article Link]({s.url})"
-            )
-        if not src_lines:
-            src_lines.append("• No active sources")
-
-        value_text = (
-            f"**Match**: `{item.match_type}` ({int(item.score * 100)}%)\n"
-            + "\n".join(src_lines)
+        all_source_ids = [s.source_id for s in app.sources] or list(app.source_ids)
+        source_ids_display = (
+            ", ".join(f"#{sid}" for sid in all_source_ids)
+            if all_source_ids
+            else "None"
         )
+
+        src_lines: List[str] = []
+        for s in app.sources:
+            src_lines.append(
+                f"- **Source #{s.source_id}** | State: `{_active_label(s.enabled)}` | "
+                f"Health: `{_health_label(s.health_status)}` | "
+                f"Provenance: `{_origin_label(s.data_origin)}`\n"
+                f"  Checked: `{_fmt_dt(s.last_checked_at)}` | [Source #{s.source_id} URL]({s.url})"
+            )
+
+        if not src_lines:
+            src_lines.append("- No associated sources registered in catalog.")
+
+        header_meta = (
+            f"**Matching Source IDs**: {source_ids_display}\n"
+            f"**Match**: `{item.match_type}` ({int(item.score * 100)}%) | **Catalog App ID**: `#{app.id}`\n"
+        )
+        value_text = header_meta + "\n".join(src_lines)
+
         embed.add_field(
-            name=f"📱 {redact_sensitive_text(app.canonical_name)} (ID #{app.id})",
+            name=f"{redact_sensitive_text(app.canonical_name)} [Sources: {source_ids_display}]",
             value=value_text[:1024],
             inline=False,
         )
 
-    embed.set_footer(text=f"Page {safe_page}/{total_pages} • AppVault Catalog")
+    embed.set_footer(text=f"Page {safe_page}/{total_pages} | AppVault Catalog")
     return embed
 
 
 def build_app_detail_embed(detail: AppDetailSchema) -> discord.Embed:
-    """Build a detailed embed for /app name:<text>."""
+    """Build a detailed, icon-free embed for /app name:<text>."""
+    all_source_ids = [s.source_id for s in detail.sources] or list(detail.source_ids)
+    source_ids_str = ", ".join(f"#{sid}" for sid in all_source_ids) if all_source_ids else "None"
+    aliases_str = ", ".join(f"`{a}`" for a in detail.aliases[:10]) if detail.aliases else "None"
+
     embed = discord.Embed(
-        title=f"📱 {redact_sensitive_text(detail.canonical_name)}",
+        title=f"Application Details: {redact_sensitive_text(detail.canonical_name)}",
         description=(
+            f"**Catalog App ID**: `#{detail.id}`\n"
             f"**Normalized Name**: `{detail.normalized_name}`\n"
             f"**Platform**: `{detail.platform or 'iOS'}`\n"
-            f"**Aliases**: {', '.join(f'`{a}`' for a in detail.aliases[:8]) if detail.aliases else 'None'}"
+            f"**Associated Source IDs**: {source_ids_str}\n"
+            f"**Aliases**: {aliases_str}"
         ),
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc),
@@ -108,38 +131,94 @@ def build_app_detail_embed(detail: AppDetailSchema) -> discord.Embed:
 
     if detail.sources:
         src_lines: List[str] = []
-        for s in detail.sources[:6]:
-            err_note = f"\n  ⚠️ Error: `{redact_sensitive_text(s.last_error)[:90]}`" if s.last_error else ""
+        for s in detail.sources:
+            err_note = (
+                f"\n  Last Error: `{redact_sensitive_text(s.last_error)[:90]}`"
+                if s.last_error
+                else ""
+            )
             src_lines.append(
-                f"• **Source #{s.source_id}** (`{s.original_title}`)\n"
-                f"  Status: {_health_badge(s.health_status)} | {_origin_badge(s.data_origin)}\n"
-                f"  Last Checked: `{_fmt_dt(s.last_checked_at)}` | [Source Page]({s.url}){err_note}"
+                f"- **Source #{s.source_id}** (Listed as: `{redact_sensitive_text(s.original_title)}`)\n"
+                f"  State: `{_active_label(s.enabled)}` | Health: `{_health_label(s.health_status)}` | "
+                f"Provenance: `{_origin_label(s.data_origin)}`\n"
+                f"  Last Checked: `{_fmt_dt(s.last_checked_at)}` | Last Success: `{_fmt_dt(s.last_success_at)}`\n"
+                f"  URL: [Source #{s.source_id} Page]({s.url}){err_note}"
             )
         embed.add_field(
-            name=f"🗂️ Tracked Sources ({len(detail.sources)})",
+            name=f"Source Relationships ({len(detail.sources)})",
             value="\n".join(src_lines)[:1024],
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Source Relationships (0)",
+            value="No associated sources registered in catalog.",
             inline=False,
         )
 
     if detail.recent_changes:
         chg_lines = [
-            f"• `{_fmt_dt(c.detected_at)}` [**#{c.source_id}** `{c.event_type}`]: "
+            f"- `{_fmt_dt(c.detected_at)}` [**Source #{c.source_id}** `{c.event_type}`]: "
             f"{redact_sensitive_text(c.summary)[:120]}"
             for c in detail.recent_changes[:5]
         ]
         embed.add_field(
-            name="🕒 Recent Source Change History",
+            name="Change History",
             value="\n".join(chg_lines)[:1024],
             inline=False,
         )
     else:
         embed.add_field(
-            name="🕒 Recent Source Change History",
-            value="No change events recorded yet for this app's sources.",
+            name="Change History",
+            value="No changes have been detected yet. Associated sources remain active in the catalog.",
             inline=False,
         )
 
-    embed.set_footer(text=f"App ID #{detail.id} • AppVault")
+    embed.set_footer(text=f"App ID #{detail.id} | Sources: {source_ids_str} | AppVault")
+    return embed
+
+
+def build_source_apps_embed(
+    *,
+    source: SourceSchema,
+    source_apps: Sequence[SourceAppItemSchema],
+    page: int = 1,
+    per_page: int = 10,
+) -> discord.Embed:
+    """Build a paginated, icon-free embed for /source-apps and /catalog [source_id]."""
+    total = len(source_apps)
+    total_pages = max(1, math.ceil(total / per_page))
+    safe_page = max(1, min(page, total_pages))
+    start = (safe_page - 1) * per_page
+    items = source_apps[start : start + per_page]
+
+    app_lines = [
+        f"`{idx:02d}.` **{redact_sensitive_text(item.original_title)}** "
+        f"— Provenance: `{_origin_label(item.data_origin)}`"
+        for idx, item in enumerate(items, start=start + 1)
+    ]
+
+    header_block = (
+        f"**Source ID**: `#{source.id}` (Key: `{source.source_key}`)\n"
+        f"**Source URL**: {source.url}\n"
+        f"**State**: `{_active_label(source.enabled)}` | **Health**: `{_health_label(source.health_status)}`\n"
+        f"**Last Checked**: `{_fmt_dt(source.last_checked_at)}` | "
+        f"**Last Successful Fetch**: `{_fmt_dt(source.last_success_at)}`\n"
+        f"**Total Apps**: `{total}` (Seed: `{source.seed_app_count}`, Observed: `{source.observed_app_count}`)"
+    )
+    if source.last_error:
+        header_block += f"\n**Last Error**: `{redact_sensitive_text(source.last_error)[:140]}`"
+
+    body_block = "\n".join(app_lines) if app_lines else "No applications associated with this source."
+
+    embed = discord.Embed(
+        title=f"Source #{source.id} Applications ({total} Total)",
+        url=source.url,
+        description=f"{header_block}\n\n**Applications (Page {safe_page}/{total_pages})**:\n{body_block}"[:4096],
+        color=discord.Color.green() if source.health_status == "healthy" else discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Page {safe_page}/{total_pages} | Source #{source.id} | AppVault")
     return embed
 
 
@@ -149,35 +228,16 @@ def build_catalog_embed(
     source_apps: Optional[Sequence[SourceAppItemSchema]],
     all_apps: Optional[Sequence[AppSummarySchema]],
     page: int = 1,
-    per_page: int = 8,
+    per_page: int = 10,
 ) -> discord.Embed:
-    """Build a paginated embed for /catalog [source_id]."""
+    """Build a paginated, icon-free embed for /catalog [source_id]."""
     if source is not None and source_apps is not None:
-        total = len(source_apps)
-        total_pages = max(1, math.ceil(total / per_page))
-        safe_page = max(1, min(page, total_pages))
-        start = (safe_page - 1) * per_page
-        items = source_apps[start : start + per_page]
-
-        lines = [
-            f"`{item.display_order + 1:02d}.` **{redact_sensitive_text(item.original_title)}** "
-            f"({_origin_badge(item.data_origin)})"
-            for item in items
-        ]
-        desc = (
-            f"**Status**: {_health_badge(source.health_status)} | "
-            f"**Last Checked**: `{_fmt_dt(source.last_checked_at)}`\n"
-            f"**Source Link**: [Open Public Listing]({source.url})\n\n"
-            + ("\n".join(lines) if lines else "No applications in this source.")
+        return build_source_apps_embed(
+            source=source,
+            source_apps=source_apps,
+            page=page,
+            per_page=per_page,
         )
-        embed = discord.Embed(
-            title=f"📚 Source #{source.id} Catalog ({total} Apps)",
-            description=desc[:4096],
-            color=discord.Color.green() if source.health_status == "healthy" else discord.Color.gold(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text=f"Page {safe_page}/{total_pages} • Source #{source.id}")
-        return embed
 
     apps_list = list(all_apps or [])
     total = len(apps_list)
@@ -186,25 +246,32 @@ def build_catalog_embed(
     start = (safe_page - 1) * per_page
     items_all = apps_list[start : start + per_page]
 
-    lines = [
-        f"• **{redact_sensitive_text(a.canonical_name)}** — Sources: "
-        + (", ".join(f"`#{sid}`" for sid in a.source_ids) if a.source_ids else "None")
-        for a in items_all
-    ]
+    lines: List[str] = []
+    for a in items_all:
+        sids = [s.source_id for s in a.sources] or list(a.source_ids)
+        sources_text = ", ".join(f"`#{sid}`" for sid in sids) if sids else "None"
+        origins = sorted({ _origin_label(s.data_origin) for s in a.sources })
+        origin_text = f" ({', '.join(origins)})" if origins else ""
+        lines.append(
+            f"- **{redact_sensitive_text(a.canonical_name)}** — Source IDs: {sources_text}{origin_text}"
+        )
+
     embed = discord.Embed(
-        title=f"📚 AppVault Complete Catalog ({total} Unique Apps)",
+        title=f"AppVault Catalog ({total} Unique Applications)",
         description=("\n".join(lines) if lines else "Catalog is empty.")[:4096],
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text=f"Page {safe_page}/{total_pages} • Browse specific source with /catalog source_id:<id>")
+    embed.set_footer(
+        text=f"Page {safe_page}/{total_pages} | Use /source-apps source_id:<id> to inspect a source"
+    )
     return embed
 
 
 def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
-    """Build embed for /source id:<integer>."""
+    """Build an icon-free embed for /source id:<integer>."""
     embed = discord.Embed(
-        title=f"🛰️ Source #{source.id} (Key: {source.source_key})",
+        title=f"Source #{source.id} Details (Key: {source.source_key})",
         url=source.url,
         description=f"**Public URL**: {source.url}",
         color=discord.Color.green() if source.health_status == "healthy" else (
@@ -212,11 +279,12 @@ def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
         ),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Health Status", value=_health_badge(source.health_status), inline=True)
-    embed.add_field(name="Enabled", value="✅ Yes" if source.enabled else "❌ No", inline=True)
+    embed.add_field(name="Health Status", value=f"`{_health_label(source.health_status)}`", inline=True)
+    embed.add_field(name="State", value=f"`{_active_label(source.enabled)}`", inline=True)
     embed.add_field(
         name="Polling Interval",
-        value=f"`{source.check_interval_seconds}s`" + (" (override)" if source.has_custom_interval else " (default)"),
+        value=f"`{source.check_interval_seconds}s`"
+        + (" (custom)" if source.has_custom_interval else " (default)"),
         inline=True,
     )
     embed.add_field(name="Last Checked", value=f"`{_fmt_dt(source.last_checked_at)}`", inline=True)
@@ -242,7 +310,7 @@ def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
         )
     if source.last_error:
         embed.add_field(
-            name="⚠️ Last Monitoring Error",
+            name="Last Monitoring Error",
             value=f"```{redact_sensitive_text(source.last_error)[:900]}```",
             inline=False,
         )
@@ -251,20 +319,24 @@ def build_source_detail_embed(source: SourceSchema) -> discord.Embed:
 
 
 def build_updates_embed(events: Sequence[ChangeEventSchema], limit: int) -> discord.Embed:
-    """Build embed for /updates [limit]."""
+    """Build an icon-free embed for /updates [limit]."""
     embed = discord.Embed(
-        title=f"🔔 Recent Detected Changes (up to {limit})",
-        description="No change events detected yet." if not events else f"Showing **{len(events)}** recent event(s):",
+        title=f"Recent Detected Changes (Limit: {limit})",
+        description=(
+            "No change events have been detected yet."
+            if not events
+            else f"Showing **{len(events)}** recent event(s):"
+        ),
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
     for ev in events[:10]:
         link_part = f" | [Source Link]({ev.source_url})" if ev.source_url else ""
         embed.add_field(
-            name=f"Event #{ev.id} • Source #{ev.source_id} (`{ev.event_type}`)",
+            name=f"Event #{ev.id} | Source #{ev.source_id} ({ev.event_type})",
             value=(
                 f"{redact_sensitive_text(ev.summary)[:400]}\n"
-                f"🕒 `{_fmt_dt(ev.detected_at)}` • Status: `{ev.notification_status}`{link_part}"
+                f"Detected: `{_fmt_dt(ev.detected_at)}` | Notification: `{ev.notification_status}`{link_part}"
             )[:1024],
             inline=False,
         )
@@ -279,21 +351,25 @@ def build_status_embed(
     db_healthy: bool,
     worker_last_heartbeat: Optional[datetime],
 ) -> discord.Embed:
-    """Build embed for /status."""
-    worker_status = "⏸️ Paused" if stats.worker_paused else "▶️ Running"
+    """Build an icon-free embed for /status."""
+    worker_status = "Paused" if stats.worker_paused else "Running"
     embed = discord.Embed(
-        title="📊 AppVault System Status",
+        title="AppVault System Status",
         color=discord.Color.green() if db_healthy else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Bot Latency", value=f"`{latency_ms:.1f} ms`", inline=True)
-    embed.add_field(name="Database Health", value="🟢 Connected" if db_healthy else "🔴 Error", inline=True)
-    embed.add_field(name="Worker Status", value=worker_status, inline=True)
+    embed.add_field(
+        name="Database Health",
+        value="`Connected`" if db_healthy else "`Unreachable`",
+        inline=True,
+    )
+    embed.add_field(name="Worker Status", value=f"`{worker_status}`", inline=True)
     embed.add_field(
         name="Sources",
         value=(
             f"Enabled: **{stats.enabled_sources}/{stats.total_sources}**\n"
-            f"🟢 Healthy: `{stats.healthy_sources}` | 🟡 Seed: `{stats.seed_only_sources}` | 🔴 Error: `{stats.error_sources}`"
+            f"Healthy: `{stats.healthy_sources}` | Seed: `{stats.seed_only_sources}` | Error: `{stats.error_sources}`"
         ),
         inline=False,
     )
@@ -321,10 +397,10 @@ def build_status_embed(
 
 
 def build_check_outcome_embed(outcome: SourceCheckOutcomeSchema) -> discord.Embed:
-    """Build embed summarizing a manual /check result."""
+    """Build an icon-free embed summarizing a manual /check result."""
     is_ok = outcome.status in ("changed", "unchanged", "not_modified")
     embed = discord.Embed(
-        title=f"🔍 Manual Check — Source #{outcome.source_id}",
+        title=f"Manual Check — Source #{outcome.source_id}",
         url=outcome.url,
         color=discord.Color.green() if is_ok else discord.Color.orange(),
         timestamp=outcome.checked_at,
@@ -335,12 +411,12 @@ def build_check_outcome_embed(outcome: SourceCheckOutcomeSchema) -> discord.Embe
         value=f"`{outcome.http_status}`" if outcome.http_status else "`N/A`",
         inline=True,
     )
-    embed.add_field(name="Data Origin", value=_origin_badge(outcome.data_origin), inline=True)
+    embed.add_field(name="Data Provenance", value=f"`{_origin_label(outcome.data_origin)}`", inline=True)
     embed.add_field(name="Catalog Apps", value=f"`{outcome.extracted_app_count}`", inline=True)
-    embed.add_field(name="Changed", value="✅ Yes" if outcome.changed else "No", inline=True)
+    embed.add_field(name="Changed", value="`Yes`" if outcome.changed else "`No`", inline=True)
     if outcome.error:
         embed.add_field(
-            name="⚠️ Error (Seed Catalog Preserved)",
+            name="Error (Seed Catalog Preserved)",
             value=f"```{redact_sensitive_text(outcome.error)[:800]}```",
             inline=False,
         )
@@ -374,7 +450,7 @@ class PaginationView(discord.ui.View):
             elif getattr(child, "custom_id", None) == "next_page":
                 child.disabled = self.current_page >= self.total_pages
 
-    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, custom_id="prev_page")
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, custom_id="prev_page")
     async def prev_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
@@ -392,7 +468,7 @@ class PaginationView(discord.ui.View):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="next_page")
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="next_page")
     async def next_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(

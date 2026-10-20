@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,7 +13,32 @@ from app.db.models import App, ChangeEvent, Source, SourceApp
 from app.monitoring.fetcher import FetchResult
 from app.monitoring.parser import ParsedArticle, parse_public_listing_html
 from app.schemas.api import SourceCheckOutcomeSchema
-from app.services.catalog import ensure_app_and_aliases
+from app.services.catalog import (
+    SEED_SOURCES,
+    ensure_app_and_aliases,
+    normalize_app_name,
+)
+
+
+def _get_seed_normalized_names_for_source(source_id: int) -> Set[str]:
+    """Return the set of normalized app names belonging to a source's seed specification."""
+    for spec in SEED_SOURCES:
+        if int(spec["id"]) == int(source_id):
+            return {
+                normalize_app_name(t, apply_spelling_fixes=True)
+                for t in spec.get("apps", ())
+                if normalize_app_name(t, apply_spelling_fixes=True)
+            }
+    return set()
+
+
+def _determine_source_origin(links: List[SourceApp]) -> str:
+    """Return 'observed' if any active link is from observed page content, else 'seed'."""
+    if not links:
+        return "seed"
+    if any(lk.data_origin == "observed" for lk in links):
+        return "observed"
+    return "seed"
 
 
 def apply_fetch_and_detect_changes(
@@ -21,23 +46,31 @@ def apply_fetch_and_detect_changes(
     source: Source,
     fetch_result: FetchResult,
 ) -> SourceCheckOutcomeSchema:
-    """Process a FetchResult for a Source, preserving seed data on errors and recording meaningful changes."""
+    """Process a FetchResult for a Source, preserving seed data on errors/304 and recording meaningful changes."""
     now = datetime.now(timezone.utc)
     source.last_checked_at = now
     source.updated_at = now
 
-    active_links = session.scalars(
+    all_links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)  # noqa: E712
-        .order_by(SourceApp.display_order.asc())
+        .where(SourceApp.source_id == source.id)
+        .order_by(SourceApp.display_order.asc(), SourceApp.app_id.asc())
     ).all()
-    current_origin = (
-        "observed"
-        if (active_links and all(lk.data_origin == "observed" for lk in active_links))
-        else "seed"
-    )
 
-    # 1. Handle failed HTTP fetch: never erase existing catalog data
+    # Ensure seed links are never left deactivated
+    seed_norms = _get_seed_normalized_names_for_source(source.id)
+    for lk in all_links:
+        if lk.data_origin == "seed" and not lk.is_active:
+            lk.is_active = True
+        elif not lk.is_active and seed_norms:
+            app_obj = session.get(App, lk.app_id)
+            if app_obj and app_obj.normalized_name in seed_norms:
+                lk.is_active = True
+
+    active_links = [lk for lk in all_links if lk.is_active]
+    current_origin = _determine_source_origin(active_links)
+
+    # 1. Handle failed HTTP fetch: never erase or deactivate existing catalog data
     if not fetch_result.ok:
         safe_error = redact_sensitive_text(fetch_result.error or "HTTP check failed")
         source.last_http_status = fetch_result.status_code
@@ -57,7 +90,7 @@ def apply_fetch_and_detect_changes(
             checked_at=now,
         )
 
-    # 2. Handle HTTP 304 Not Modified
+    # 2. Handle HTTP 304 Not Modified: never interpret 304 as an empty document; preserve seed/observed records
     if fetch_result.not_modified:
         source.last_success_at = now
         source.last_http_status = 304
@@ -84,7 +117,7 @@ def apply_fetch_and_detect_changes(
     # 3. Parse HTML content
     parsed: ParsedArticle = parse_public_listing_html(fetch_result.content)
 
-    # If extraction found 0 apps and no meaningful body, treat as unparseable and preserve seed data
+    # If extraction found 0 apps and no meaningful body, treat as unparseable and preserve catalog
     if not parsed.apps and not parsed.sanitized_body_lines:
         err_msg = "Page fetched but no parseable public app listing or article content found; preserving catalog"
         source.last_http_status = fetch_result.status_code or 200
@@ -104,22 +137,23 @@ def apply_fetch_and_detect_changes(
             checked_at=now,
         )
 
-    # If the page returned body text but 0 app bullets, preserve existing seed apps while recording body state
     previous_hash = source.current_content_hash
     old_app_names: List[str] = []
+    old_app_ids: Set[int] = set()
     for lk in active_links:
         app_obj = session.get(App, lk.app_id)
         if app_obj:
             old_app_names.append(app_obj.canonical_name)
+            old_app_ids.add(app_obj.id)
 
     added_titles: List[str] = []
     removed_titles: List[str] = []
-    effective_origin = current_origin
 
     if parsed.apps:
-        effective_origin = "observed"
         new_app_ids_ordered: List[int] = []
         new_canonical_names: List[str] = []
+        max_order = max((lk.display_order for lk in active_links), default=-1)
+
         for idx, raw_title in enumerate(parsed.apps):
             try:
                 app_obj, _created, _alias_cnt = ensure_app_and_aliases(session, raw_title)
@@ -132,12 +166,13 @@ def apply_fetch_and_detect_changes(
 
             existing_link = session.get(SourceApp, (source.id, app_obj.id))
             if existing_link is None:
+                max_order += 1
                 session.add(
                     SourceApp(
                         source_id=source.id,
                         app_id=app_obj.id,
                         original_title=raw_title,
-                        display_order=idx,
+                        display_order=idx if not active_links else max_order,
                         data_origin="observed",
                         is_active=True,
                         first_seen_at=now,
@@ -145,22 +180,37 @@ def apply_fetch_and_detect_changes(
                     )
                 )
             else:
-                existing_link.original_title = raw_title
-                existing_link.display_order = idx
+                # Preserve original seed title if this was a seed record, but mark provenance as observed
+                if existing_link.data_origin != "seed":
+                    existing_link.original_title = raw_title
+                    existing_link.display_order = idx
                 existing_link.data_origin = "observed"
                 existing_link.is_active = True
                 existing_link.last_seen_at = now
 
         old_set = set(old_app_names)
-        new_set = set(new_canonical_names)
         added_titles = [n for n in new_canonical_names if n not in old_set]
-        removed_titles = [n for n in old_app_names if n not in new_set]
 
-        # Deactivate apps no longer listed on a successfully parsed page (only when >=1 valid app extracted)
-        if new_app_ids_ordered:
-            for lk in active_links:
-                if lk.app_id not in new_app_ids_ordered:
+        # Only deactivate previously observed non-seed apps if the page was not a seed-backed instructional page
+        for lk in active_links:
+            if lk.app_id not in new_app_ids_ordered:
+                app_obj = session.get(App, lk.app_id)
+                is_seed_entry = (lk.data_origin == "seed") or (
+                    app_obj is not None and app_obj.normalized_name in seed_norms
+                )
+                if not is_seed_entry:
                     lk.is_active = False
+                    if app_obj:
+                        removed_titles.append(app_obj.canonical_name)
+
+    session.flush()
+    updated_active_links = session.scalars(
+        select(SourceApp)
+        .where(SourceApp.source_id == source.id, SourceApp.is_active == True)  # noqa: E712
+        .order_by(SourceApp.display_order.asc())
+    ).all()
+    effective_origin = _determine_source_origin(updated_active_links)
+    active_count = len(updated_active_links)
 
     source.last_success_at = now
     source.last_http_status = fetch_result.status_code or 200
@@ -181,7 +231,7 @@ def apply_fetch_and_detect_changes(
             http_status=source.last_http_status,
             changed=False,
             change_event_id=None,
-            extracted_app_count=len(parsed.apps) if parsed.apps else len(active_links),
+            extracted_app_count=active_count,
             data_origin=effective_origin,
             error=None,
             checked_at=now,
@@ -191,7 +241,7 @@ def apply_fetch_and_detect_changes(
     if previous_hash is None:
         event_type = "initial_observation"
         summary_parts = [
-            f"Source #{source.id} verified live ({len(parsed.apps)} apps observed)."
+            f"Source #{source.id} verified live ({active_count} apps in catalog)."
         ]
         if added_titles:
             summary_parts.append(f"Added: {', '.join(added_titles[:5])}")
@@ -229,6 +279,7 @@ def apply_fetch_and_detect_changes(
             "added_apps": added_titles,
             "removed_apps": removed_titles,
             "observed_app_count": len(parsed.apps),
+            "active_catalog_count": active_count,
         }
         new_event = ChangeEvent(
             source_id=source.id,
@@ -255,7 +306,7 @@ def apply_fetch_and_detect_changes(
         http_status=source.last_http_status,
         changed=True,
         change_event_id=change_event_id,
-        extracted_app_count=len(parsed.apps) if parsed.apps else len(active_links),
+        extracted_app_count=active_count,
         data_origin=effective_origin,
         error=None,
         checked_at=now,

@@ -59,18 +59,18 @@ class AppVaultBot(discord.Client):
         return hashlib.sha256(payload).hexdigest()
 
     async def setup_hook(self) -> None:
-        """Synchronize slash commands only when needed or when a dev guild ID is configured."""
+        """Synchronize slash commands when the command tree hash changes or when forced."""
         sig_hash = self.compute_command_signature_hash()
         should_sync = self.force_sync or self.settings.sync_commands_on_startup
 
         with session_scope() as session:
             state = get_or_create_worker_state(session)
-            if state.last_command_sync_hash != sig_hash and self.settings.discord_guild_id is not None:
+            if state.last_command_sync_hash != sig_hash:
                 should_sync = True
 
         if not should_sync:
             logger.info(
-                "Skipping automatic global command sync on startup (hash=%s). Pass --sync or set SYNC_COMMANDS_ON_STARTUP=true to sync.",
+                "Slash command definitions unchanged (hash=%s); skipping redundant startup sync.",
                 sig_hash[:12],
             )
             return
@@ -113,7 +113,7 @@ class AppVaultBot(discord.Client):
             getattr(interaction, "channel_id", "unknown"),
             safe_err,
         )
-        msg = "⚠️ An error occurred while processing the command."
+        msg = "An error occurred while processing the command."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(

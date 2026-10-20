@@ -20,13 +20,13 @@ DiscordSenderFunc = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 def build_change_notification_embed_dict(event: ChangeEvent, source: Optional[Source]) -> Dict[str, Any]:
-    """Construct a safe, secret-scrubbed Discord embed payload for a ChangeEvent."""
+    """Construct a safe, secret-scrubbed, icon-free Discord embed payload for a ChangeEvent."""
     safe_summary = redact_sensitive_text(event.summary or "Source update detected.")
     source_url = source.url if source else None
     source_label = f"Source #{event.source_id}" + (f" (ID {source.source_key})" if source else "")
 
     return {
-        "title": f"🔔 AppVault Update — {source_label}",
+        "title": f"AppVault Update — {source_label}",
         "description": safe_summary[:2000],
         "url": source_url,
         "color": 0x2ECC71 if event.event_type in ("apps_updated", "initial_observation") else 0x3498DB,
@@ -40,7 +40,7 @@ def build_change_notification_embed_dict(event: ChangeEvent, source: Optional[So
                 "inline": True,
             },
         ],
-        "footer": {"text": "AppVault Monitor • Credentials & sensitive data excluded"},
+        "footer": {"text": "AppVault Monitor | Credentials & sensitive data excluded"},
     }
 
 
@@ -152,7 +152,6 @@ async def dispatch_pending_notifications(
         if not acquire_event_notification_lease(session, event, worker_id):
             continue
 
-        # Filter subscriptions interested in this event_type
         matching_subs: List[DiscordSubscription] = []
         for sub in active_subscriptions:
             types_raw = (sub.subscribed_event_types or "all").lower()
@@ -161,8 +160,6 @@ async def dispatch_pending_notifications(
                 matching_subs.append(sub)
 
         if not matching_subs:
-            # No active subscriptions configured; keep event in DB as 'pending' until a channel subscribes
-            # or if token not configured and 0 subscriptions, release lease cleanly
             event.notification_status = "pending"
             event.lease_owner = None
             event.lease_expires_at = None

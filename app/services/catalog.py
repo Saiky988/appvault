@@ -20,7 +20,7 @@ from app.schemas.api import (
     SourceBriefSchema,
 )
 
-SEED_CATALOG_VERSION = "2026.10.1"
+SEED_CATALOG_VERSION = "2026.10.2"
 
 # Spelling corrections applied ONLY to normalized search fields (never overwriting original_title)
 SPELLING_CORRECTIONS: Dict[str, str] = {
@@ -278,6 +278,8 @@ def reload_seed_catalog(
     seed_sources: Sequence[Dict[str, Any]] = SEED_SOURCES,
 ) -> CatalogReloadResponseSchema:
     """Idempotently load or reload the versioned seed catalog without erasing history or subscriptions."""
+    from app.monitoring.parser import is_ignored_candidate_title
+
     sources_created = 0
     sources_updated = 0
     apps_created = 0
@@ -349,6 +351,17 @@ def reload_seed_catalog(
                 link.is_active = True
                 links_updated += 1
 
+        # Clean up any non-seed links on this source that match instructional/UI boilerplate
+        existing_source_links = session.scalars(
+            select(SourceApp).where(SourceApp.source_id == source.id)
+        ).all()
+        for link in existing_source_links:
+            if link.app_id not in seen_app_ids_in_source and (
+                is_ignored_candidate_title(link.original_title)
+                or contains_sensitive_credentials(link.original_title)
+            ):
+                session.delete(link)
+
         session.flush()
 
     return CatalogReloadResponseSchema(
@@ -363,21 +376,26 @@ def reload_seed_catalog(
     )
 
 
-def build_app_summary(session: Session, app: App) -> AppSummarySchema:
-    """Hydrate an AppSummarySchema with its linked sources and aliases."""
+def get_app_source_briefs(session: Session, app_id: int) -> List[SourceBriefSchema]:
+    """Return all active SourceBriefSchema records associated with an App (authoritative shared query)."""
     links = session.scalars(
         select(SourceApp)
-        .where(SourceApp.app_id == app.id, SourceApp.is_active == True)  # noqa: E712
+        .where(SourceApp.app_id == app_id, SourceApp.is_active == True)  # noqa: E712
         .order_by(SourceApp.source_id.asc(), SourceApp.display_order.asc())
     ).all()
 
+    if not links:
+        links = session.scalars(
+            select(SourceApp)
+            .where(SourceApp.app_id == app_id)
+            .order_by(SourceApp.source_id.asc(), SourceApp.display_order.asc())
+        ).all()
+
     source_briefs: List[SourceBriefSchema] = []
-    source_ids: List[int] = []
     for link in links:
         src = session.get(Source, link.source_id)
         if src is None:
             continue
-        source_ids.append(src.id)
         source_briefs.append(
             SourceBriefSchema(
                 source_id=src.id,
@@ -394,6 +412,13 @@ def build_app_summary(session: Session, app: App) -> AppSummarySchema:
                 last_error=src.last_error,
             )
         )
+    return source_briefs
+
+
+def build_app_summary(session: Session, app: App) -> AppSummarySchema:
+    """Hydrate an AppSummarySchema with its linked sources and aliases."""
+    source_briefs = get_app_source_briefs(session, app.id)
+    source_ids = [s.source_id for s in source_briefs]
 
     aliases = session.scalars(
         select(AppAlias.alias)
